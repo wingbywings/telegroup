@@ -28,6 +28,14 @@ class ChatConfig:
             self.chat_link = None
         # 可选：群组名称，用于报告标题
         self.name: Optional[str] = raw.get("name")
+        # 可选：群组类型，用于AI分析策略（"crypto" 加密货币群 / "tech" 技术项目群）
+        # 如果不指定，AI会根据消息内容自动判断
+        self.chat_type: Optional[str] = raw.get("chat_type")
+        if self.chat_type:
+            self.chat_type = self.chat_type.strip().lower()
+            if self.chat_type not in ("crypto", "tech"):
+                log.warning("Invalid chat_type '%s' for chat %s, will auto-detect", self.chat_type, self.chat_id)
+                self.chat_type = None
 
 
 class Config:
@@ -401,7 +409,7 @@ def format_user(user_id: Optional[int], username: Optional[str]) -> str:
     return "unknown"
 
 
-def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime, chat_id: int, chat_name: Optional[str] = None) -> str:
+def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime, chat_id: int, chat_name: Optional[str] = None, chat_type: Optional[str] = None) -> str:
     """为指定群组生成日报"""
     day_end = day_start + timedelta(days=1)
     conn.row_factory = sqlite3.Row
@@ -465,7 +473,7 @@ def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime, 
     else:
         lines.append("- 无")
 
-    lines.extend(build_ai_summary_section(rows, cfg, day_start, chat_id))
+    lines.extend(build_ai_summary_section(rows, cfg, day_start, chat_id, chat_name, chat_type))
 
     report = "\n".join(lines)
     # 报告文件名包含 chat_id，如果有名称则使用名称（清理特殊字符）
@@ -480,7 +488,7 @@ def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime, 
     return report
 
 
-def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: datetime, chat_id: int) -> List[str]:
+def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: datetime, chat_id: int, chat_name: Optional[str] = None, chat_type: Optional[str] = None) -> List[str]:
     if not cfg.enable_ai_summary:
         return []
 
@@ -554,6 +562,8 @@ def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: da
 
                 payload: Dict[str, Any] = {
                     "chat_id": chat_id,
+                    "chat_name": chat_name,
+                    "chat_type": chat_type,  # "crypto" 或 "tech"，如果为 None 则 AI 自动判断
                     "date": day_start.date().isoformat(),
                     "timezone": tz_name,
                     "thread_id": thread_id,
@@ -604,21 +614,59 @@ def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: da
 
                 if all_categories:
                     lines.append("")
-                    lines.append("  - 分类（合并所有批次）：")
+                    lines.append("  - 分类详情（合并所有批次）：")
                     # 合并相同名称的分类
-                    category_map: Dict[str, List[str]] = {}
+                    category_map: Dict[str, List[Dict[str, Any]]] = {}
                     for cat in all_categories:
                         name = cat.get("name") or "未命名分类"
-                        summary = cat.get("summary") or ""
                         if name not in category_map:
                             category_map[name] = []
-                        category_map[name].append(summary)
-
-                    for name, summaries in category_map.items():
-                        if len(summaries) == 1:
-                            lines.append(f"    - {name}: {summaries[0]}")
-                        else:
-                            lines.append(f"    - {name}: {', '.join(summaries)}")
+                        category_map[name].append(cat)
+                    
+                    # 定义标准分类的优先级顺序
+                    category_priority = {
+                        "关键事件": 1,
+                        "技术更新/开发者动态": 2,
+                        "技术更新": 2,
+                        "开发者动态": 2,
+                        "潜在风险&预警": 3,
+                        "潜在风险": 3,
+                        "预警": 3,
+                        "市场/社区情绪": 4,
+                        "市场情绪": 4,
+                        "社区情绪": 4,
+                        "需要关注的后续行动": 5,
+                        "后续行动": 5,
+                    }
+                    
+                    def get_priority(cat_name: str) -> int:
+                        return category_priority.get(cat_name, 99)
+                    
+                    sorted_names = sorted(category_map.keys(), key=get_priority)
+                    
+                    for name in sorted_names:
+                        cats = category_map[name]
+                        all_message_ids = []
+                        summaries = []
+                        for cat in cats:
+                            summary = cat.get("summary") or ""
+                            if summary:
+                                summaries.append(summary)
+                            msg_ids = cat.get("messages") or []
+                            all_message_ids.extend(msg_ids)
+                        
+                        # 去重消息ID
+                        unique_message_ids = list(dict.fromkeys(all_message_ids))
+                        message_refs = f"（消息ID: {', '.join(map(str, unique_message_ids[:5]))}" + ("..." if len(unique_message_ids) > 5 else "") + ")" if unique_message_ids else ""
+                        
+                        lines.append(f"    - **{name}**{message_refs}")
+                        if summaries:
+                            # 合并多个批次的摘要
+                            combined_summary = " | ".join(summaries) if len(summaries) > 1 else summaries[0]
+                            summary_lines = combined_summary.split("\n")
+                            for line in summary_lines:
+                                if line.strip():
+                                    lines.append(f"      {line}")
 
         else:
             # 消息数量不多，直接处理
@@ -637,6 +685,8 @@ def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: da
 
             payload: Dict[str, Any] = {
                 "chat_id": chat_id,
+                "chat_name": chat_name,
+                "chat_type": chat_type,  # "crypto" 或 "tech"，如果为 None 则 AI 自动判断
                 "date": day_start.date().isoformat(),
                 "timezone": tz_name,
                 "thread_id": thread_id,
@@ -670,12 +720,42 @@ def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: da
 
             categories = data.get("categories") or []
             if categories:
+                # 定义标准分类的优先级顺序（按重要性）
+                category_priority = {
+                    "关键事件": 1,
+                    "技术更新/开发者动态": 2,
+                    "技术更新": 2,  # 兼容变体
+                    "开发者动态": 2,
+                    "潜在风险&预警": 3,
+                    "潜在风险": 3,  # 兼容变体
+                    "预警": 3,
+                    "市场/社区情绪": 4,
+                    "市场情绪": 4,  # 兼容变体
+                    "社区情绪": 4,
+                    "需要关注的后续行动": 5,
+                    "后续行动": 5,  # 兼容变体
+                }
+                
+                # 按优先级排序
+                def get_priority(cat_name: str) -> int:
+                    return category_priority.get(cat_name, 99)  # 未定义的分类排在最后
+                
+                sorted_categories = sorted(categories, key=lambda c: get_priority(c.get("name", "")))
+                
                 lines.append("")
-                lines.append("  - 分类：")
-                for cat in categories:
+                lines.append("  - 分类详情：")
+                for cat in sorted_categories:
                     name = cat.get("name") or "未命名分类"
                     summary = cat.get("summary") or ""
-                    lines.append(f"    - {name}: {summary}")
+                    message_ids = cat.get("messages") or []
+                    message_refs = f"（消息ID: {', '.join(map(str, message_ids[:5]))}" + ("..." if len(message_ids) > 5 else "") + ")" if message_ids else ""
+                    lines.append(f"    - **{name}**{message_refs}")
+                    if summary:
+                        # 如果摘要包含多行，适当缩进
+                        summary_lines = summary.split("\n")
+                        for line in summary_lines:
+                            if line.strip():
+                                lines.append(f"      {line}")
             else:
                 lines.append("  - 未返回分类结果。")
 
@@ -760,6 +840,7 @@ def main() -> None:
                         day_start,
                         chat_config.chat_id,
                         chat_config.name,
+                        chat_config.chat_type,
                     )
                     if report_text.strip():
                         all_reports.append(report_text)

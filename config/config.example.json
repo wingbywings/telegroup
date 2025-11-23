@@ -24,11 +24,13 @@
     {
       "chat_id": -1001234567890,
       "chat_link": "https://t.me/your_group_username",
-      "name": "群组1"
+      "name": "群组1",
+      "chat_type": "crypto"
     },
     {
       "chat_id": -1009876543210,
-      "name": "群组2"
+      "name": "群组2",
+      "chat_type": "tech"
     },
     {
       "chat_link": "https://t.me/another_group",
