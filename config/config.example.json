@@ -1,0 +1,22 @@
+{
+  "api_id": 123456,
+  "api_hash": "your_api_hash_here",
+  "phone": "+1234567890",
+  "session_path": "config/telethon.session",
+  "chat_id": -1001234567890,
+  "db_path": "data/messages.db",
+  "report_dir": "reports",
+  "timezone": "Asia/Shanghai",
+  "last_id_path": "data/last_id.txt",
+  "pull_days": 2,
+  "send_report_to_me": true,
+  "download_media": true,
+  "media_dir": "data/media",
+  "max_media_mb": 10,
+  "enable_ai_summary": false,
+  "ai_api_base": "https://api.example.com/v1",
+  "ai_api_key": "YOUR_AI_API_KEY",
+  "ai_model": "grok-beta",
+  "ai_max_categories": 5,
+  "ai_style": "concise"
+}

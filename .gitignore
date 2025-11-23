@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Telethon sessions
+*.session
+*.session-journal
+config/config.json
+
+# Data & reports
+data/*.db
+reports/*.md
+data/media/
