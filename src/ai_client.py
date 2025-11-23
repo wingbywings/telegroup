@@ -17,7 +17,7 @@ def call_chat_analysis(
     api_key: str,
     payload: Dict[str, Any],
     model: str = "grok-beta",
-    timeout: float = 30.0,
+    timeout: float = 120.0,
 ) -> Dict[str, Any]:
     """
     Call x.ai-compatible chat/completions and ask model to return structured JSON.
@@ -54,8 +54,16 @@ def call_chat_analysis(
 
     try:
         resp = httpx.post(url, headers=headers, json=data, timeout=timeout)
+    except (
+        httpx.ReadTimeout,
+        httpx.ConnectTimeout,
+        httpx.WriteTimeout,
+        httpx.PoolTimeout,
+        httpx.TimeoutException,
+    ) as exc:
+        raise AISummaryError(f"请求超时（{timeout}秒），请尝试增加 ai_timeout 配置或检查网络连接") from exc
     except Exception as exc:  # pragma: no cover - network errors
-        raise AISummaryError(f"request failed: {exc}") from exc
+        raise AISummaryError(f"请求失败: {exc}") from exc
 
     log.info("AI raw response status=%s body=%s", resp.status_code, resp.text)
 

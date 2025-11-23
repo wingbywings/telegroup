@@ -44,6 +44,7 @@ class Config:
         self.ai_api_key: str = str(raw.get("ai_api_key", "")).strip()
         self.ai_model: str = str(raw.get("ai_model", "grok-beta")).strip()
         self.ai_max_categories: int = int(raw.get("ai_max_categories", 5))
+        self.ai_timeout: float = float(raw.get("ai_timeout", 120.0))
         self.ai_style: Optional[str] = str(raw["ai_style"]).strip() if "ai_style" in raw else None
 
 
@@ -357,7 +358,9 @@ def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: da
         len(messages),
     )
     try:
-        data = call_chat_analysis(cfg.ai_api_base, cfg.ai_api_key, payload, model=cfg.ai_model)
+        data = call_chat_analysis(
+            cfg.ai_api_base, cfg.ai_api_key, payload, model=cfg.ai_model, timeout=cfg.ai_timeout
+        )
     except AISummaryError as exc:
         lines.append(f"- AI 摘要生成失败：{exc}")
         log.warning("AI summary failed: %s", exc)
