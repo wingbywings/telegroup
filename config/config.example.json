@@ -19,5 +19,6 @@
   "ai_model": "grok-beta",
   "ai_max_categories": 5,
   "ai_timeout": 120,
-  "ai_style": "concise"
+  "ai_style": "concise",
+  "ai_max_messages_per_batch": 200
 }

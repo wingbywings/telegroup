@@ -46,6 +46,7 @@ class Config:
         self.ai_max_categories: int = int(raw.get("ai_max_categories", 5))
         self.ai_timeout: float = float(raw.get("ai_timeout", 120.0))
         self.ai_style: Optional[str] = str(raw["ai_style"]).strip() if "ai_style" in raw else None
+        self.ai_max_messages_per_batch: int = int(raw.get("ai_max_messages_per_batch", 200))
 
 
 def load_config(path: Path) -> Config:
@@ -78,6 +79,7 @@ def ensure_db(cfg: Config) -> None:
                 reply_to INTEGER,
                 date TEXT NOT NULL,
                 file_path TEXT,
+                thread_id INTEGER,
                 PRIMARY KEY (chat_id, message_id)
             );
             """
@@ -86,6 +88,36 @@ def ensure_db(cfg: Config) -> None:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
         if "file_path" not in cols:
             conn.execute("ALTER TABLE messages ADD COLUMN file_path TEXT;")
+        # Migration: ensure thread_id column exists and populate it
+        if "thread_id" not in cols:
+            conn.execute("ALTER TABLE messages ADD COLUMN thread_id INTEGER;")
+            # 根据 reply_to 字段进行分类：
+            # - 如果 reply_to 不为 NULL，则 thread_id = reply_to（属于回复该消息的线程）
+            # - 如果 reply_to 为 NULL，则 thread_id = -1（顶层消息，统一归类）
+            conn.execute(
+                """
+                UPDATE messages
+                SET thread_id = CASE
+                    WHEN reply_to IS NOT NULL THEN reply_to
+                    ELSE -1
+                END
+                """
+            )
+            conn.commit()
+            log.info("Added thread_id column and populated based on reply_to classification")
+        else:
+            # Migration: update existing records where reply_to is NULL to use thread_id = -1
+            conn.execute(
+                """
+                UPDATE messages
+                SET thread_id = -1
+                WHERE reply_to IS NULL AND thread_id != -1
+                """
+            )
+            conn.commit()
+            updated = conn.execute("SELECT changes()").fetchone()[0]
+            if updated > 0:
+                log.info("Updated %s messages without reply_to to thread_id=-1", updated)
         conn.commit()
     finally:
         conn.close()
@@ -199,12 +231,16 @@ async def fetch_incremental(client: TelegramClient, cfg: Config) -> None:
                 else:
                     log.debug("Skip media download for msg %s due to size or unknown", msg.id)
             reply_to = msg.reply_to.reply_to_msg_id if msg.reply_to else None
+            # 根据 reply_to 字段进行分类：
+            # - 如果 reply_to 不为 NULL，则 thread_id = reply_to（属于回复该消息的线程）
+            # - 如果 reply_to 为 NULL，则 thread_id = -1（顶层消息，统一归类）
+            thread_id = reply_to if reply_to is not None else -1
             text = msg.message or ""
             conn.execute(
                 """
                 INSERT OR IGNORE INTO messages
-                (chat_id, message_id, user_id, username, text, media_type, file_id, reply_to, date, file_path)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (chat_id, message_id, user_id, username, text, media_type, file_id, reply_to, date, file_path, thread_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     msg.chat_id,
@@ -217,6 +253,7 @@ async def fetch_incremental(client: TelegramClient, cfg: Config) -> None:
                     reply_to,
                     msg_dt.isoformat(),
                     str(file_path) if file_path else None,
+                    thread_id,
                 ),
             )
             inserted += 1
@@ -244,7 +281,7 @@ def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime) 
     conn.row_factory = sqlite3.Row
     cur = conn.execute(
         """
-        SELECT message_id, user_id, username, text, media_type, reply_to, date
+        SELECT message_id, user_id, username, text, media_type, reply_to, date, thread_id
         FROM messages
         WHERE chat_id = ? AND date >= ? AND date < ?
         ORDER BY date ASC
@@ -314,7 +351,7 @@ def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: da
     if not cfg.enable_ai_summary:
         return []
 
-    lines = ["", "## AI 分类摘要"]
+    lines = ["", "## AI 线程摘要"]
 
     if not cfg.ai_api_base:
         lines.append("- AI 摘要未生成：缺少 ai_api_base 配置。")
@@ -326,67 +363,190 @@ def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: da
         log.warning("AI summary enabled but ai_api_key not set.")
         return lines
 
-    tz_name = getattr(cfg.timezone, "key", None) or str(cfg.timezone)
-    messages = []
+    # 按 thread_id 分组消息
+    threads: Dict[int, List[sqlite3.Row]] = {}
     for row in rows:
-        messages.append(
-            {
-                "id": row["message_id"],
-                "user": format_user(row["user_id"], row["username"]),
-                "ts": row["date"],
-                "text": row["text"] or "",
-                "media_type": row["media_type"],
-                "reply_to": row["reply_to"],
-            }
-        )
+        thread_id = row["thread_id"]
+        if thread_id not in threads:
+            threads[thread_id] = []
+        threads[thread_id].append(row)
 
-    payload: Dict[str, Any] = {
-        "chat_id": cfg.chat_id,
-        "date": day_start.date().isoformat(),
-        "timezone": tz_name,
-        "messages": messages,
-    }
-    if cfg.ai_max_categories:
-        payload["max_categories"] = cfg.ai_max_categories
-    if cfg.ai_style:
-        payload["style"] = cfg.ai_style
-
-    log.info(
-        "Calling AI summary: base=%s model=%s messages=%s",
-        cfg.ai_api_base,
-        cfg.ai_model,
-        len(messages),
-    )
-    try:
-        data = call_chat_analysis(
-            cfg.ai_api_base, cfg.ai_api_key, payload, model=cfg.ai_model, timeout=cfg.ai_timeout
-        )
-    except AISummaryError as exc:
-        lines.append(f"- AI 摘要生成失败：{exc}")
-        log.warning("AI summary failed: %s", exc)
+    # 过滤掉消息数量小于 10 的线程
+    valid_threads = {tid: msgs for tid, msgs in threads.items() if len(msgs) >= 10}
+    
+    if not valid_threads:
+        lines.append("- 没有符合条件的线程（消息数量 >= 10）。")
         return lines
 
-    overall = data.get("overall")
-    if overall:
-        lines.append(f"- 总览：{overall}")
+    lines.append(f"- 共 {len(valid_threads)} 个线程符合分析条件（消息数量 >= 10）")
+    lines.append("")
 
-    categories = data.get("categories") or []
-    if categories:
-        lines.append("")
-        lines.append("### 分类")
-        for cat in categories:
-            name = cat.get("name") or "未命名分类"
-            summary = cat.get("summary") or ""
-            lines.append(f"- {name}: {summary}")
-    else:
-        lines.append("- 未返回分类结果。")
+    tz_name = getattr(cfg.timezone, "key", None) or str(cfg.timezone)
 
-    actions = data.get("actions") or []
-    if actions:
+    # 为每个符合条件的线程分别调用 AI 分析
+    for thread_id, thread_rows in sorted(valid_threads.items(), key=lambda x: len(x[1]), reverse=True):
+        thread_name = "顶层消息" if thread_id == -1 else f"线程 {thread_id}"
+        total_messages = len(thread_rows)
+        lines.append(f"### {thread_name}（{total_messages} 条消息）")
+
+        # 如果消息数量超过阈值，进行分段处理
+        if total_messages > cfg.ai_max_messages_per_batch:
+            num_batches = (total_messages + cfg.ai_max_messages_per_batch - 1) // cfg.ai_max_messages_per_batch
+            lines.append(f"  - 消息数量较多，将分成 {num_batches} 个批次处理（每批最多 {cfg.ai_max_messages_per_batch} 条）")
+            lines.append("")
+
+            all_overalls: List[str] = []
+            all_categories: List[Dict[str, Any]] = []
+            batch_failed = False
+
+            # 分段处理
+            for batch_idx in range(num_batches):
+                start_idx = batch_idx * cfg.ai_max_messages_per_batch
+                end_idx = min(start_idx + cfg.ai_max_messages_per_batch, total_messages)
+                batch_rows = thread_rows[start_idx:end_idx]
+                batch_num = batch_idx + 1
+
+                messages = []
+                for row in batch_rows:
+                    messages.append(
+                        {
+                            "id": row["message_id"],
+                            "user": format_user(row["user_id"], row["username"]),
+                            "ts": row["date"],
+                            "text": row["text"] or "",
+                            "media_type": row["media_type"],
+                            "reply_to": row["reply_to"],
+                        }
+                    )
+
+                payload: Dict[str, Any] = {
+                    "chat_id": cfg.chat_id,
+                    "date": day_start.date().isoformat(),
+                    "timezone": tz_name,
+                    "thread_id": thread_id,
+                    "messages": messages,
+                    "batch_info": f"批次 {batch_num}/{num_batches}，共 {total_messages} 条消息",
+                }
+                if cfg.ai_max_categories:
+                    payload["max_categories"] = cfg.ai_max_categories
+                if cfg.ai_style:
+                    payload["style"] = cfg.ai_style
+
+                log.info(
+                    "Calling AI summary for thread %s batch %s/%s: base=%s model=%s messages=%s",
+                    thread_id,
+                    batch_num,
+                    num_batches,
+                    cfg.ai_api_base,
+                    cfg.ai_model,
+                    len(messages),
+                )
+                try:
+                    data = call_chat_analysis(
+                        cfg.ai_api_base, cfg.ai_api_key, payload, model=cfg.ai_model, timeout=cfg.ai_timeout
+                    )
+                except AISummaryError as exc:
+                    lines.append(f"    - AI 摘要生成失败：{exc}")
+                    log.warning("AI summary failed for thread %s batch %s: %s", thread_id, batch_num, exc)
+                    batch_failed = True
+                    lines.append("")
+                    continue
+
+                batch_overall = data.get("overall")
+                if batch_overall:
+                    all_overalls.append(f"批次 {batch_num}: {batch_overall}")
+
+                batch_categories = data.get("categories") or []
+                if batch_categories:
+                    all_categories.extend(batch_categories)
+
+            # 合并所有批次的结果
+            if batch_failed and not all_overalls and not all_categories:
+                lines.append("  - 所有批次处理失败")
+            else:
+                if all_overalls:
+                    lines.append("  - 总览（各批次摘要）：")
+                    for overall in all_overalls:
+                        lines.append(f"    - {overall}")
+
+                if all_categories:
+                    lines.append("")
+                    lines.append("  - 分类（合并所有批次）：")
+                    # 合并相同名称的分类
+                    category_map: Dict[str, List[str]] = {}
+                    for cat in all_categories:
+                        name = cat.get("name") or "未命名分类"
+                        summary = cat.get("summary") or ""
+                        if name not in category_map:
+                            category_map[name] = []
+                        category_map[name].append(summary)
+
+                    for name, summaries in category_map.items():
+                        if len(summaries) == 1:
+                            lines.append(f"    - {name}: {summaries[0]}")
+                        else:
+                            lines.append(f"    - {name}: {', '.join(summaries)}")
+
+        else:
+            # 消息数量不多，直接处理
+            messages = []
+            for row in thread_rows:
+                messages.append(
+                    {
+                        "id": row["message_id"],
+                        "user": format_user(row["user_id"], row["username"]),
+                        "ts": row["date"],
+                        "text": row["text"] or "",
+                        "media_type": row["media_type"],
+                        "reply_to": row["reply_to"],
+                    }
+                )
+
+            payload: Dict[str, Any] = {
+                "chat_id": cfg.chat_id,
+                "date": day_start.date().isoformat(),
+                "timezone": tz_name,
+                "thread_id": thread_id,
+                "messages": messages,
+            }
+            if cfg.ai_max_categories:
+                payload["max_categories"] = cfg.ai_max_categories
+            if cfg.ai_style:
+                payload["style"] = cfg.ai_style
+
+            log.info(
+                "Calling AI summary for thread %s: base=%s model=%s messages=%s",
+                thread_id,
+                cfg.ai_api_base,
+                cfg.ai_model,
+                len(messages),
+            )
+            try:
+                data = call_chat_analysis(
+                    cfg.ai_api_base, cfg.ai_api_key, payload, model=cfg.ai_model, timeout=cfg.ai_timeout
+                )
+            except AISummaryError as exc:
+                lines.append(f"  - AI 摘要生成失败：{exc}")
+                log.warning("AI summary failed for thread %s: %s", thread_id, exc)
+                lines.append("")
+                continue
+
+            overall = data.get("overall")
+            if overall:
+                lines.append(f"  - 总览：{overall}")
+
+            categories = data.get("categories") or []
+            if categories:
+                lines.append("")
+                lines.append("  - 分类：")
+                for cat in categories:
+                    name = cat.get("name") or "未命名分类"
+                    summary = cat.get("summary") or ""
+                    lines.append(f"    - {name}: {summary}")
+            else:
+                lines.append("  - 未返回分类结果。")
+
         lines.append("")
-        lines.append("### 行动项")
-        for act in actions:
-            lines.append(f"- {act}")
 
     return lines
 

@@ -31,11 +31,12 @@ def call_chat_analysis(
     sys_prompt = (
         "你是一个对群聊消息进行摘要的助手。"
         "给定聊天的元数据和消息，请返回一个包含以下键的JSON对象："
-        "overall（字符串），categories（{name, summary, messages}组成的列表），actions（字符串列表）。"
+        "overall（字符串），categories（{name, summary, messages}组成的列表）。"
         "请简明扼要；如有提供max_categories，则分类不超过该数量。"
     )
     user_prompt = (
         "请分析以下群聊消息，并根据要求生成前述的JSON对象。"
+        "请用中文回答。"
         "在messages字段中仅保留消息id以便溯源。"
         "输入JSON：\n" + json.dumps(payload, ensure_ascii=False)
     )
