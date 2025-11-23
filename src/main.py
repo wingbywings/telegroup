@@ -21,7 +21,15 @@ class Config:
         self.api_hash: str = str(raw["api_hash"])
         self.phone: str = str(raw["phone"])
         self.session_path: Path = Path(raw.get("session_path", "config/telethon.session"))
-        self.chat_id: int = int(raw["chat_id"])
+        chat_link_raw = raw.get("chat_link")
+        if chat_link_raw:
+            self.chat_link: Optional[str] = str(chat_link_raw).strip()
+            if not self.chat_link:  # 空字符串转为 None
+                self.chat_link = None
+        else:
+            self.chat_link = None
+        # chat_id 将在初始化时从 chat_link 获取，如果提供了 chat_link
+        self.chat_id: int = int(raw.get("chat_id", 0))
         self.db_path: Path = Path(raw.get("db_path", "data/messages.db"))
         self.report_dir: Path = Path(raw.get("report_dir", "reports"))
         self.media_dir: Path = Path(raw.get("media_dir", "data/media"))
@@ -138,6 +146,32 @@ def set_last_id(cfg: Config, value: int) -> None:
 
 def build_client(cfg: Config) -> TelegramClient:
     return TelegramClient(str(cfg.session_path), cfg.api_id, cfg.api_hash)
+
+
+async def get_chat_id_from_link(client: TelegramClient, chat_link: str) -> int:
+    """
+    从 Telegram 群聊分享链接获取 chat_id。
+    
+    Args:
+        client: TelegramClient 实例
+        chat_link: 群聊分享链接，例如 "https://t.me/nofx_dev_community"
+    
+    Returns:
+        chat_id: 用于 API 调用的 chat_id（通常以 -100 开头）
+    """
+    entity = await client.get_entity(chat_link)
+    real_id = entity.id
+    # 对于超级群组，chat_id 通常是 -100 + real_id
+    # 如果 real_id 已经是负数（可能是频道或其他类型），直接使用
+    # 否则加上 -100 前缀（超级群组的常见格式）
+    if real_id < 0:
+        chat_id = real_id
+        log.info("Entity ID is already negative, using as-is: %s", chat_id)
+    else:
+        # 将 real_id 转换为字符串，然后加上 -100 前缀
+        chat_id = int(f"-100{real_id}")
+    log.info("Resolved chat_link %s to chat_id %s (entity.id: %s)", chat_link, chat_id, real_id)
+    return chat_id
 
 
 def normalize_dt(dt: datetime, tz: timezone) -> datetime:
@@ -583,6 +617,16 @@ def main() -> None:
 
         if not client.loop.run_until_complete(client.is_user_authorized()):
             raise RuntimeError("Session not authorized. Run with --init-session first.")
+
+        # 如果配置了 chat_link，从链接获取 chat_id
+        if cfg.chat_link:
+            if not cfg.chat_id or cfg.chat_id == 0:
+                log.info("Resolving chat_id from chat_link: %s", cfg.chat_link)
+                cfg.chat_id = client.loop.run_until_complete(get_chat_id_from_link(client, cfg.chat_link))
+            else:
+                log.info("Both chat_link and chat_id are configured. Using chat_id: %s", cfg.chat_id)
+        elif not cfg.chat_id or cfg.chat_id == 0:
+            raise ValueError("Either chat_id or chat_link must be configured in config.json")
 
         if args.pull:
             client.loop.run_until_complete(fetch_incremental(client, cfg))

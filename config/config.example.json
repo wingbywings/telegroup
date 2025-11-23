@@ -4,6 +4,7 @@
   "phone": "+1234567890",
   "session_path": "config/telethon.session",
   "chat_id": -1001234567890,
+  "chat_link": "https://t.me/your_group_username",
   "db_path": "data/messages.db",
   "report_dir": "reports",
   "timezone": "Asia/Shanghai",
