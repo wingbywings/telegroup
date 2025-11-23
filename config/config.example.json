@@ -3,12 +3,10 @@
   "api_hash": "your_api_hash_here",
   "phone": "+1234567890",
   "session_path": "config/telethon.session",
-  "chat_id": -1001234567890,
-  "chat_link": "https://t.me/your_group_username",
   "db_path": "data/messages.db",
   "report_dir": "reports",
   "timezone": "Asia/Shanghai",
-  "last_id_path": "data/last_id.txt",
+  "last_id_path": "data/last_id.json",
   "pull_days": 2,
   "send_report_to_me": true,
   "download_media": true,
@@ -21,5 +19,20 @@
   "ai_max_categories": 5,
   "ai_timeout": 120,
   "ai_style": "concise",
-  "ai_max_messages_per_batch": 200
+  "ai_max_messages_per_batch": 200,
+  "chats": [
+    {
+      "chat_id": -1001234567890,
+      "chat_link": "https://t.me/your_group_username",
+      "name": "群组1"
+    },
+    {
+      "chat_id": -1009876543210,
+      "name": "群组2"
+    },
+    {
+      "chat_link": "https://t.me/another_group",
+      "name": "群组3"
+    }
+  ]
 }

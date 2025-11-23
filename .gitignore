@@ -12,4 +12,4 @@ config/config.json
 data/*.db
 reports/*.md
 data/media/
-data/last_id.txt
+data/last_id.json

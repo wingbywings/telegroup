@@ -15,12 +15,10 @@ from ai_client import AISummaryError, call_chat_analysis
 log = logging.getLogger(__name__)
 
 
-class Config:
+class ChatConfig:
+    """单个群组的配置"""
     def __init__(self, raw: Dict[str, Any]) -> None:
-        self.api_id: int = int(raw["api_id"])
-        self.api_hash: str = str(raw["api_hash"])
-        self.phone: str = str(raw["phone"])
-        self.session_path: Path = Path(raw.get("session_path", "config/telethon.session"))
+        self.chat_id: int = int(raw.get("chat_id", 0))
         chat_link_raw = raw.get("chat_link")
         if chat_link_raw:
             self.chat_link: Optional[str] = str(chat_link_raw).strip()
@@ -28,8 +26,43 @@ class Config:
                 self.chat_link = None
         else:
             self.chat_link = None
-        # chat_id 将在初始化时从 chat_link 获取，如果提供了 chat_link
-        self.chat_id: int = int(raw.get("chat_id", 0))
+        # 可选：群组名称，用于报告标题
+        self.name: Optional[str] = raw.get("name")
+
+
+class Config:
+    def __init__(self, raw: Dict[str, Any]) -> None:
+        self.api_id: int = int(raw["api_id"])
+        self.api_hash: str = str(raw["api_hash"])
+        self.phone: str = str(raw["phone"])
+        self.session_path: Path = Path(raw.get("session_path", "config/telethon.session"))
+        
+        # 支持多个群组配置
+        # 优先使用新的 chats 数组格式，如果没有则向后兼容旧的 chat_id/chat_link
+        if "chats" in raw:
+            self.chats: List[ChatConfig] = [ChatConfig(chat_raw) for chat_raw in raw["chats"]]
+        else:
+            # 向后兼容：将旧的 chat_id/chat_link 转换为 chats 数组
+            chat_config = {}
+            if "chat_id" in raw:
+                chat_config["chat_id"] = raw["chat_id"]
+            if "chat_link" in raw:
+                chat_link_raw = raw["chat_link"]
+                if chat_link_raw:
+                    chat_config["chat_link"] = str(chat_link_raw).strip() or None
+            if chat_config:
+                self.chats = [ChatConfig(chat_config)]
+            else:
+                self.chats = []
+        
+        # 保持向后兼容的单个 chat_id 和 chat_link（用于旧代码）
+        if self.chats:
+            self.chat_id: int = self.chats[0].chat_id
+            self.chat_link: Optional[str] = self.chats[0].chat_link
+        else:
+            self.chat_id = 0
+            self.chat_link = None
+        
         self.db_path: Path = Path(raw.get("db_path", "data/messages.db"))
         self.report_dir: Path = Path(raw.get("report_dir", "reports"))
         self.media_dir: Path = Path(raw.get("media_dir", "data/media"))
@@ -42,7 +75,7 @@ class Config:
                 self.timezone = ZoneInfo(tz_name)
             except Exception as exc:  # pragma: no cover - best effort fallback
                 log.warning("Failed to load timezone %s: %s, fallback to UTC", tz_name, exc)
-        self.last_id_path: Path = Path(raw.get("last_id_path", "data/last_id.txt"))
+        self.last_id_path: Path = Path(raw.get("last_id_path", "data/last_id.json"))
         self.pull_days: int = int(raw.get("pull_days", 2))
         self.send_report_to_me: bool = bool(raw.get("send_report_to_me", True))
         self.download_media: bool = bool(raw.get("download_media", True))
@@ -131,17 +164,49 @@ def ensure_db(cfg: Config) -> None:
         conn.close()
 
 
-def get_last_id(cfg: Config) -> int:
+def get_last_id(cfg: Config, chat_id: int) -> int:
+    """获取指定群组的 last_id"""
     if not cfg.last_id_path.exists():
+        # 尝试迁移旧的 last_id.txt 文件
+        old_path = cfg.last_id_path.parent / "last_id.txt"
+        if old_path.exists():
+            try:
+                old_value = int(old_path.read_text().strip() or "0")
+                # 迁移到新格式
+                data = {str(cfg.chat_id): old_value}
+                cfg.last_id_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                log.info("Migrated last_id.txt to last_id.json for chat_id %s", cfg.chat_id)
+                return old_value
+            except (ValueError, KeyError):
+                pass
         return 0
     try:
-        return int(cfg.last_id_path.read_text().strip() or "0")
-    except ValueError:
+        data = json.loads(cfg.last_id_path.read_text(encoding="utf-8"))
+        # 支持旧格式（单个数字）和新格式（JSON 对象）
+        if isinstance(data, dict):
+            return int(data.get(str(chat_id), 0))
+        else:
+            # 旧格式：单个数字，只对第一个群组有效
+            return int(data) if chat_id == cfg.chat_id else 0
+    except (json.JSONDecodeError, ValueError, KeyError):
         return 0
 
 
-def set_last_id(cfg: Config, value: int) -> None:
-    cfg.last_id_path.write_text(str(value))
+def set_last_id(cfg: Config, chat_id: int, value: int) -> None:
+    """设置指定群组的 last_id"""
+    data: Dict[str, int] = {}
+    if cfg.last_id_path.exists():
+        try:
+            existing = json.loads(cfg.last_id_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict):
+                data = existing
+            else:
+                # 迁移旧格式
+                data = {str(cfg.chat_id): int(existing)}
+        except (json.JSONDecodeError, ValueError):
+            pass
+    data[str(chat_id)] = value
+    cfg.last_id_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def build_client(cfg: Config) -> TelegramClient:
@@ -231,16 +296,25 @@ async def init_session(client: TelegramClient, cfg: Config) -> None:
     log.info("Session saved to %s", cfg.session_path)
 
 
-async def fetch_incremental(client: TelegramClient, cfg: Config) -> None:
-    last_id = get_last_id(cfg)
+async def fetch_incremental_for_chat(
+    client: TelegramClient,
+    cfg: Config,
+    chat_config: ChatConfig,
+    conn: sqlite3.Connection,
+) -> None:
+    """为单个群组拉取增量消息"""
+    chat_id = chat_config.chat_id
+    chat_name = chat_config.name or f"chat_{chat_id}"
+    last_id = get_last_id(cfg, chat_id)
     cutoff = datetime.now(tz=cfg.timezone) - timedelta(days=cfg.pull_days)
-    conn = sqlite3.connect(cfg.db_path)
-    conn.row_factory = sqlite3.Row
     inserted = 0
     max_id = last_id
+    
+    log.info("Fetching messages for %s (chat_id: %s, last_id: %s)", chat_name, chat_id, last_id)
+    
     try:
         async for msg in client.iter_messages(
-            cfg.chat_id,
+            chat_id,
             min_id=last_id,
             reverse=True,
         ):
@@ -293,13 +367,30 @@ async def fetch_incremental(client: TelegramClient, cfg: Config) -> None:
             inserted += 1
             if msg.id > max_id:
                 max_id = msg.id
+    except Exception as exc:
+        log.error("Error fetching messages for %s (chat_id: %s): %s", chat_name, chat_id, exc)
+        raise
+
+    if max_id != last_id:
+        set_last_id(cfg, chat_id, max_id)
+    log.info("Pulled %s new messages for %s (chat_id: %s, last_id %s -> %s)", 
+             inserted, chat_name, chat_id, last_id, max_id)
+
+
+async def fetch_incremental(client: TelegramClient, cfg: Config) -> None:
+    """为所有配置的群组拉取增量消息"""
+    if not cfg.chats:
+        log.warning("No chats configured. Nothing to fetch.")
+        return
+    
+    conn = sqlite3.connect(cfg.db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        for chat_config in cfg.chats:
+            await fetch_incremental_for_chat(client, cfg, chat_config, conn)
         conn.commit()
     finally:
         conn.close()
-
-    if max_id != last_id:
-        set_last_id(cfg, max_id)
-    log.info("Pulled %s new messages (last_id %s -> %s)", inserted, last_id, max_id)
 
 
 def format_user(user_id: Optional[int], username: Optional[str]) -> str:
@@ -310,7 +401,8 @@ def format_user(user_id: Optional[int], username: Optional[str]) -> str:
     return "unknown"
 
 
-def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime) -> str:
+def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime, chat_id: int, chat_name: Optional[str] = None) -> str:
+    """为指定群组生成日报"""
     day_end = day_start + timedelta(days=1)
     conn.row_factory = sqlite3.Row
     cur = conn.execute(
@@ -320,7 +412,7 @@ def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime) 
         WHERE chat_id = ? AND date >= ? AND date < ?
         ORDER BY date ASC
         """,
-        (cfg.chat_id, day_start.isoformat(), day_end.isoformat()),
+        (chat_id, day_start.isoformat(), day_end.isoformat()),
     )
     rows = cur.fetchall()
     total = len(rows)
@@ -342,8 +434,9 @@ def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime) 
 
     lines = []
     date_str = day_start.date().isoformat()
-    lines.append(f"# {date_str} 群日报")
-    lines.append(f"- 群 ID: `{cfg.chat_id}`")
+    chat_display_name = chat_name or f"群组 {chat_id}"
+    lines.append(f"# {date_str} {chat_display_name} 日报")
+    lines.append(f"- 群 ID: `{chat_id}`")
     lines.append(f"- 时间范围: {day_start.isoformat()} ~ {day_end.isoformat()}")
     lines.append(f"- 总消息数: {total}")
     lines.append(f"- 发言人数: {len(user_stats)}")
@@ -372,16 +465,22 @@ def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime) 
     else:
         lines.append("- 无")
 
-    lines.extend(build_ai_summary_section(rows, cfg, day_start))
+    lines.extend(build_ai_summary_section(rows, cfg, day_start, chat_id))
 
     report = "\n".join(lines)
-    report_path = cfg.report_dir / f"{date_str}.md"
+    # 报告文件名包含 chat_id，如果有名称则使用名称（清理特殊字符）
+    if chat_name:
+        safe_name = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in chat_name)
+        report_filename = f"{date_str}_{safe_name}_{chat_id}.md"
+    else:
+        report_filename = f"{date_str}_{chat_id}.md"
+    report_path = cfg.report_dir / report_filename
     report_path.write_text(report, encoding="utf-8")
     log.info("Report written to %s", report_path)
     return report
 
 
-def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: datetime) -> List[str]:
+def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: datetime, chat_id: int) -> List[str]:
     if not cfg.enable_ai_summary:
         return []
 
@@ -454,7 +553,7 @@ def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: da
                     )
 
                 payload: Dict[str, Any] = {
-                    "chat_id": cfg.chat_id,
+                    "chat_id": chat_id,
                     "date": day_start.date().isoformat(),
                     "timezone": tz_name,
                     "thread_id": thread_id,
@@ -537,7 +636,7 @@ def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: da
                 )
 
             payload: Dict[str, Any] = {
-                "chat_id": cfg.chat_id,
+                "chat_id": chat_id,
                 "date": day_start.date().isoformat(),
                 "timezone": tz_name,
                 "thread_id": thread_id,
@@ -618,15 +717,30 @@ def main() -> None:
         if not client.loop.run_until_complete(client.is_user_authorized()):
             raise RuntimeError("Session not authorized. Run with --init-session first.")
 
-        # 如果配置了 chat_link，从链接获取 chat_id
-        if cfg.chat_link:
-            if not cfg.chat_id or cfg.chat_id == 0:
-                log.info("Resolving chat_id from chat_link: %s", cfg.chat_link)
-                cfg.chat_id = client.loop.run_until_complete(get_chat_id_from_link(client, cfg.chat_link))
-            else:
-                log.info("Both chat_link and chat_id are configured. Using chat_id: %s", cfg.chat_id)
-        elif not cfg.chat_id or cfg.chat_id == 0:
-            raise ValueError("Either chat_id or chat_link must be configured in config.json")
+        # 解析所有群组的 chat_id
+        if not cfg.chats:
+            raise ValueError("No chats configured. Please configure at least one chat in config.json")
+        
+        for chat_config in cfg.chats:
+            # 如果配置了 chat_link，从链接获取 chat_id
+            if chat_config.chat_link:
+                if not chat_config.chat_id or chat_config.chat_id == 0:
+                    log.info("Resolving chat_id from chat_link: %s", chat_config.chat_link)
+                    chat_config.chat_id = client.loop.run_until_complete(
+                        get_chat_id_from_link(client, chat_config.chat_link)
+                    )
+                else:
+                    log.info("Both chat_link and chat_id are configured for %s. Using chat_id: %s", 
+                             chat_config.name or "chat", chat_config.chat_id)
+            elif not chat_config.chat_id or chat_config.chat_id == 0:
+                raise ValueError(
+                    f"Either chat_id or chat_link must be configured for chat: {chat_config.name or 'unnamed'}"
+                )
+        
+        # 更新向后兼容的单个 chat_id（用于旧代码）
+        if cfg.chats:
+            cfg.chat_id = cfg.chats[0].chat_id
+            cfg.chat_link = cfg.chats[0].chat_link
 
         if args.pull:
             client.loop.run_until_complete(fetch_incremental(client, cfg))
@@ -635,16 +749,28 @@ def main() -> None:
             conn = sqlite3.connect(cfg.db_path)
             try:
                 today = datetime.now(tz=cfg.timezone).date()
-                report_text = generate_report(
-                    conn,
-                    cfg,
-                    datetime.combine(today, datetime.min.time(), tzinfo=cfg.timezone),
-                )
+                day_start = datetime.combine(today, datetime.min.time(), tzinfo=cfg.timezone)
+                all_reports: List[str] = []
+                
+                # 为每个群组生成报告
+                for chat_config in cfg.chats:
+                    report_text = generate_report(
+                        conn,
+                        cfg,
+                        day_start,
+                        chat_config.chat_id,
+                        chat_config.name,
+                    )
+                    if report_text.strip():
+                        all_reports.append(report_text)
             finally:
                 conn.close()
-            if cfg.send_report_to_me and report_text.strip():
+            
+            # 如果配置了发送报告，将所有报告合并发送
+            if cfg.send_report_to_me and all_reports:
+                combined_report = "\n\n---\n\n".join(all_reports)
                 client.loop.run_until_complete(
-                    client.send_message("me", report_text, parse_mode="md")
+                    client.send_message("me", combined_report, parse_mode="md")
                 )
 
 
