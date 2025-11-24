@@ -67,11 +67,32 @@ def _build_report_header(
     lines = []
     date_str = day_start.date().isoformat()
     chat_display_name = chat_name or f"群组 {chat_id}"
-    lines.append(f"# {date_str} {chat_display_name} 日报")
-    lines.append(f"- 群 ID: `{chat_id}`")
-    lines.append(f"- 时间范围: {day_start.isoformat()} ~ {day_end.isoformat()}")
-    lines.append(f"- 总消息数: {total}")
-    lines.append(f"- 发言人数: {user_count}")
+    
+    # 格式化日期显示
+    weekday_map = {0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五", 5: "周六", 6: "周日"}
+    weekday = weekday_map[day_start.weekday()]
+    date_display = f"{date_str} {weekday}"
+    
+    # 格式化时间范围（只显示日期和时间，不显示时区）
+    time_start = day_start.strftime("%H:%M")
+    time_end = day_end.strftime("%H:%M")
+    
+    lines.append(f"# 📊 {date_display} {chat_display_name} 日报")
+    lines.append("")
+    lines.append("---")
+    lines.append("")
+    lines.append("### 📋 基本信息")
+    lines.append("")
+    lines.append("| 项目 | 内容 |")
+    lines.append("|------|------|")
+    lines.append(f"| **群组名称** | {chat_display_name} |")
+    lines.append(f"| **群组 ID** | `{chat_id}` |")
+    lines.append(f"| **报告日期** | {date_str} ({weekday}) |")
+    lines.append(f"| **时间范围** | {time_start} ~ {time_end} |")
+    lines.append(f"| **总消息数** | **{total}** 条 |")
+    lines.append(f"| **发言人数** | **{user_count}** 人 |")
+    lines.append("")
+    lines.append("---")
     lines.append("")
     return lines
 
@@ -85,12 +106,12 @@ def _build_report_content(
     chat_link: Optional[str] = None,
 ) -> List[str]:
     """
-    构建报告内容部分（活跃用户、媒体分布、热门线程）
+    构建报告内容部分（活跃用户、媒体分布）
     
     Args:
         user_stats: 用户统计
         media_stats: 媒体统计
-        thread_stats: 线程统计
+        thread_stats: 线程统计（已弃用，保留以兼容接口）
         conn: 数据库连接
         chat_id: 群组ID
         chat_link: 群组链接（可选）
@@ -100,54 +121,46 @@ def _build_report_content(
     """
     lines = []
     top_users = sorted(user_stats.items(), key=lambda x: x[1], reverse=True)[:TOP_N_USERS]
-    top_threads = sorted(thread_stats.items(), key=lambda x: x[1], reverse=True)[:TOP_N_THREADS]
 
-    lines.append("## 活跃用户 Top 5")
+    # 活跃用户 Top 5
+    lines.append("## 👥 活跃用户 Top 5")
+    lines.append("")
     if top_users:
-        for name, cnt in top_users:
-            lines.append(f"- {name}: {cnt}")
+        lines.append("| 排名 | 用户名 | 消息数 |")
+        lines.append("|------|--------|--------|")
+        rank_icons = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        for idx, (name, cnt) in enumerate(top_users):
+            rank_icon = rank_icons[idx] if idx < len(rank_icons) else f"{idx + 1}."
+            lines.append(f"| {rank_icon} | {name} | **{cnt}** |")
     else:
-        lines.append("- 无")
+        lines.append("*暂无活跃用户数据*")
     lines.append("")
 
-    lines.append("## 媒体分布")
+    # 媒体分布
+    lines.append("## 📎 媒体分布")
+    lines.append("")
     if media_stats:
-        for m, cnt in media_stats.items():
-            lines.append(f"- {m}: {cnt}")
+        # 媒体类型显示名称映射
+        media_display_names = {
+            "MessageMediaPhoto": "📷 图片",
+            "MessageMediaDocument": "📄 文档",
+            "MessageMediaWebPage": "🔗 网页链接",
+            "MessageMediaPoll": "📊 投票",
+            "MessageMediaVideo": "🎥 视频",
+            "MessageMediaAudio": "🎵 音频",
+            "MessageMediaVoice": "🎤 语音",
+        }
+        
+        lines.append("| 媒体类型 | 数量 |")
+        lines.append("|----------|------|")
+        total_media = sum(media_stats.values())
+        for media_type, cnt in sorted(media_stats.items(), key=lambda x: x[1], reverse=True):
+            display_name = media_display_names.get(media_type, f"📎 {media_type}")
+            percentage = (cnt / total_media * 100) if total_media > 0 else 0
+            lines.append(f"| {display_name} | **{cnt}** ({percentage:.1f}%) |")
     else:
-        lines.append("- 无")
+        lines.append("*今日无媒体消息*")
     lines.append("")
-
-    lines.append("## 热门回复线程")
-    if top_threads:
-        for mid, cnt in top_threads:
-            # 查询被回复的消息详情
-            replied_msg = get_replied_message(conn, chat_id, mid)
-            if replied_msg:
-                replied_user = format_user(replied_msg["user_id"], replied_msg["username"])
-                replied_text = replied_msg["text"] or ""
-                if replied_text:
-                    # 截取前50个字符
-                    preview = replied_text[:50] + ("..." if len(replied_text) > 50 else "")
-                    preview = preview.replace("\n", " ").strip()
-                else:
-                    preview = "[媒体消息]" if replied_msg["media_type"] else "[空消息]"
-                
-                # 生成消息链接
-                if chat_link:
-                    msg_link = f"{chat_link}/{mid}"
-                    lines.append(f"- 回复消息 [{mid}]({msg_link}) ({replied_user}): {preview} — {cnt} 条回复")
-                else:
-                    lines.append(f"- 回复消息 {mid} ({replied_user}): {preview} — {cnt} 条回复")
-            else:
-                # 被回复的消息不在数据库中（可能是历史消息）
-                if chat_link:
-                    msg_link = f"{chat_link}/{mid}"
-                    lines.append(f"- 回复消息 [{mid}]({msg_link}): {cnt} 条回复（原消息不在数据库中）")
-                else:
-                    lines.append(f"- 回复消息 {mid}: {cnt} 条回复（原消息不在数据库中）")
-    else:
-        lines.append("- 无")
 
     return lines
 
@@ -425,8 +438,10 @@ def _format_category_output(
     
     sorted_names = sorted(category_map.keys(), key=get_priority)
     
-    section_title = "  - 分类详情（合并所有批次）：" if is_batch else "  - 分类详情："
-    lines.append(section_title)
+    lines.append("#### 📂 分类详情")
+    if is_batch:
+        lines.append("*（合并所有批次）*")
+    lines.append("")
     
     # 收集所有消息ID用于原始引用部分
     all_message_refs: List[Tuple[int, str]] = []
@@ -436,8 +451,10 @@ def _format_category_output(
         message_ids = cat_data["message_ids"]
         summaries = cat_data["summaries"]
         
-        # 只显示分类名称，不显示消息引用
-        lines.append(f"    - **{name}**")
+        # 分类标题
+        lines.append(f"##### 🔸 {name}")
+        lines.append("")
+        
         if summaries:
             if is_batch and len(summaries) > 1:
                 # 合并多个批次的摘要
@@ -448,7 +465,8 @@ def _format_category_output(
             summary_lines = combined_summary.split("\n")
             for line in summary_lines:
                 if line.strip():
-                    lines.append(f"      {line}")
+                    lines.append(f"{line}")
+            lines.append("")
         
         # 收集该分类的所有消息引用
         for msg_id in message_ids:
@@ -470,7 +488,9 @@ def _format_category_output(
     
     # 添加原始引用分类
     if all_message_refs:
-        lines.append("    - **原始引用：**")
+        lines.append("---")
+        lines.append("")
+        lines.append("#### 📎 原始消息引用")
         lines.append("")
         # 去重消息ID（保持顺序）
         seen_ids = set()
@@ -485,14 +505,18 @@ def _format_category_output(
             if chat_link:
                 msg_link = f"{chat_link}/{msg_id}"
                 if display_text:
-                    lines.append(f"      {idx}. [{msg_id}：{display_text}]({msg_link})")
+                    # 转义特殊字符以避免破坏Markdown格式（表格中的 | 需要转义）
+                    safe_text = display_text.replace("|", "\\|")
+                    lines.append(f"{idx}. [{msg_id}]({msg_link})：{safe_text}")
                 else:
-                    lines.append(f"      {idx}. [{msg_id}]({msg_link})")
+                    lines.append(f"{idx}. [{msg_id}]({msg_link})")
             else:
                 if display_text:
-                    lines.append(f"      {idx}. {msg_id}：{display_text}")
+                    safe_text = display_text.replace("|", "\\|")
+                    lines.append(f"{idx}. {msg_id}：{safe_text}")
                 else:
-                    lines.append(f"      {idx}. {msg_id}")
+                    lines.append(f"{idx}. {msg_id}")
+        lines.append("")
     
     return lines
 
@@ -545,13 +569,19 @@ def _process_single_thread(
             cfg.ai_api_base, cfg.ai_api_key, payload, model=cfg.ai_model, timeout=cfg.ai_timeout
         )
     except AISummaryError as exc:
-        lines.append(f"  - AI 摘要生成失败：{exc}")
+        lines.append("⚠️ **AI 摘要生成失败**")
+        lines.append("")
+        lines.append(f"错误信息：{exc}")
+        lines.append("")
         log.warning("AI summary failed for thread %s: %s", thread_id, exc)
         return lines
 
     overall = data.get("overall")
     if overall:
-        lines.append(f"  - 总览：{overall}")
+        lines.append("#### 📝 总览")
+        lines.append("")
+        lines.append(f"> {overall}")
+        lines.append("")
 
     categories = data.get("categories") or []
     if categories:
@@ -559,7 +589,8 @@ def _process_single_thread(
         category_map = _merge_categories(sorted_categories)
         lines.extend(_format_category_output(category_map, is_batch=False, chat_link=chat_link, message_map=message_map))
     else:
-        lines.append("  - 未返回分类结果。")
+        lines.append("*未返回分类结果*")
+        lines.append("")
 
     return lines
 
@@ -598,9 +629,9 @@ def _process_thread_batch(
     total_messages = len(thread_rows)
     num_batches = (total_messages + cfg.ai_max_messages_per_batch - 1) // cfg.ai_max_messages_per_batch
     
-    lines.append(
-        f"  - 消息数量较多，将分成 {num_batches} 个批次处理（每批最多 {cfg.ai_max_messages_per_batch} 条）"
-    )
+    lines.append("#### ⚙️ 批次处理信息")
+    lines.append("")
+    lines.append(f"消息数量较多，将分成 **{num_batches}** 个批次处理（每批最多 {cfg.ai_max_messages_per_batch} 条）")
     lines.append("")
 
     all_overalls: List[str] = []
@@ -641,10 +672,10 @@ def _process_thread_batch(
                 cfg.ai_api_base, cfg.ai_api_key, payload, model=cfg.ai_model, timeout=cfg.ai_timeout
             )
         except AISummaryError as exc:
-            lines.append(f"    - AI 摘要生成失败：{exc}")
+            lines.append(f"⚠️ **批次 {batch_num} AI 摘要生成失败**：{exc}")
+            lines.append("")
             log.warning("AI summary failed for thread %s batch %s: %s", thread_id, batch_num, exc)
             batch_failed = True
-            lines.append("")
             continue
 
         batch_overall = data.get("overall")
@@ -657,15 +688,17 @@ def _process_thread_batch(
 
     # 合并所有批次的结果
     if batch_failed and not all_overalls and not all_categories:
-        lines.append("  - 所有批次处理失败")
+        lines.append("⚠️ **所有批次处理失败**")
+        lines.append("")
     else:
         if all_overalls:
-            lines.append("  - 总览（各批次摘要）：")
+            lines.append("#### 📝 总览（各批次摘要）")
+            lines.append("")
             for overall in all_overalls:
-                lines.append(f"    - {overall}")
+                lines.append(f"- {overall}")
+            lines.append("")
 
         if all_categories:
-            lines.append("")
             category_map = _merge_categories(all_categories)
             lines.extend(_format_category_output(category_map, is_batch=True, chat_link=chat_link, message_map=message_map))
 
@@ -686,20 +719,20 @@ def build_ai_summary_section(
     if not cfg.enable_ai_summary:
         return []
 
-    lines = ["", "## AI 线程摘要"]
+    lines = ["", "---", "", "## 🤖 智能话题摘要"]
 
     if not cfg.ai_api_base:
-        lines.append("- AI 摘要未生成：缺少 ai_api_base 配置。")
+        lines.append("⚠️ **AI 摘要未生成**：缺少 `ai_api_base` 配置")
         log.warning("AI summary enabled but ai_api_base not set.")
         return lines
 
     if not cfg.ai_api_key:
-        lines.append("- AI 摘要未生成：缺少 ai_api_key 配置。")
+        lines.append("⚠️ **AI 摘要未生成**：缺少 `ai_api_key` 配置")
         log.warning("AI summary enabled but ai_api_key not set.")
         return lines
     
     if not conn:
-        lines.append("- AI 摘要未生成：缺少数据库连接。")
+        lines.append("⚠️ **AI 摘要未生成**：缺少数据库连接")
         log.warning("AI summary enabled but database connection not provided.")
         return lines
 
@@ -713,10 +746,10 @@ def build_ai_summary_section(
     valid_threads = {tid: msgs for tid, msgs in threads.items() if len(msgs) >= threshold}
 
     if not valid_threads:
-        lines.append(f"- 没有符合条件的线程（消息数量 >= {threshold}）。")
+        lines.append(f"*没有符合条件的线程（消息数量 >= {threshold}）*")
         return lines
 
-    lines.append(f"- 共 {len(valid_threads)} 个线程符合分析条件（消息数量 >= {threshold}）")
+    lines.append(f"**共 {len(valid_threads)} 个线程符合分析条件**（消息数量 >= {threshold}）")
     lines.append("")
 
     tz_name = getattr(cfg.timezone, "key", None) or str(cfg.timezone)
@@ -734,7 +767,8 @@ def build_ai_summary_section(
     for thread_id, thread_rows in sorted(valid_threads.items(), key=lambda x: len(x[1]), reverse=True):
         thread_name = "顶层消息" if thread_id == TOP_THREAD_ID else f"线程 {thread_id}"
         total_messages = len(thread_rows)
-        lines.append(f"### {thread_name}（{total_messages} 条消息）")
+        lines.append(f"### 💭 {thread_name}（{total_messages} 条消息）")
+        lines.append("")
 
         # 如果消息数量超过阈值，进行分段处理
         if total_messages > cfg.ai_max_messages_per_batch:
