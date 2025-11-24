@@ -223,13 +223,13 @@ def generate_report(
 
 def _group_messages_by_thread(rows: List[sqlite3.Row]) -> Dict[int, List[sqlite3.Row]]:
     """
-    按 thread_id 分组消息
+    按 thread_id 分组消息，并确保每个线程内的消息按时间顺序排序
     
     Args:
-        rows: 消息行列表
+        rows: 消息行列表（应该已经按时间排序）
     
     Returns:
-        按 thread_id 分组的消息字典
+        按 thread_id 分组的消息字典，每个线程内的消息按时间顺序排序
     """
     threads: Dict[int, List[sqlite3.Row]] = {}
     for row in rows:
@@ -237,6 +237,11 @@ def _group_messages_by_thread(rows: List[sqlite3.Row]) -> Dict[int, List[sqlite3
         if thread_id not in threads:
             threads[thread_id] = []
         threads[thread_id].append(row)
+    
+    # 确保每个线程内的消息按时间顺序排序
+    for thread_id in threads:
+        threads[thread_id].sort(key=lambda r: r["date"])
+    
     return threads
 
 
@@ -249,18 +254,22 @@ def _convert_rows_to_messages(
     将数据库行转换为消息字典列表，包含完整的回复关系信息
     
     如果消息回复了不在数据库中的消息，则跳过该消息（不发送给AI）
+    确保返回的消息列表按时间顺序排序。
     
     Args:
-        rows: 消息行列表
+        rows: 消息行列表（应该已经按时间排序）
         conn: 数据库连接
         chat_id: 群组ID
     
     Returns:
-        消息字典列表，包含回复关系信息
+        消息字典列表，包含回复关系信息，按时间顺序排序
     """
+    # 确保输入的消息按时间排序
+    sorted_rows = sorted(rows, key=lambda r: r["date"])
+    
     messages = []
     skipped_count = 0
-    for row in rows:
+    for row in sorted_rows:
         msg_dict = {
             "id": row["message_id"],
             "user": format_user(row["user_id"], row["username"]),

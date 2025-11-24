@@ -114,7 +114,7 @@ async def fetch_incremental_for_chat(
                 continue
             media_type, file_id = extract_media(msg.media)
             # 忽略所有 media_type 不为空的消息
-            if media_type is not None:
+            if media_type is not None or media_type != "":
                 continue
             file_path: Optional[Path] = None
             if cfg.download_media and media_type and not is_video_or_voice(msg):
