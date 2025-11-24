@@ -765,7 +765,7 @@ def build_ai_summary_section(
 
     # 为每个符合条件的线程分别调用 AI 分析
     for thread_id, thread_rows in sorted(valid_threads.items(), key=lambda x: len(x[1]), reverse=True):
-        thread_name = "顶层消息" if thread_id == TOP_THREAD_ID else f"线程 {thread_id}"
+        thread_name = "普通消息" if thread_id == TOP_THREAD_ID else f"线程 {thread_id}"
         total_messages = len(thread_rows)
         lines.append(f"### 💭 {thread_name}（{total_messages} 条消息）")
         lines.append("")
