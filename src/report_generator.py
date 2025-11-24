@@ -749,7 +749,7 @@ def build_ai_summary_section(
         lines.append(f"*没有符合条件的线程（消息数量 >= {threshold}）*")
         return lines
 
-    lines.append(f"**共 {len(valid_threads)} 个线程符合分析条件**（消息数量 >= {threshold}）")
+    lines.append(f"**共 {len(valid_threads)} 个线程符合分析条件**")
     lines.append("")
 
     tz_name = getattr(cfg.timezone, "key", None) or str(cfg.timezone)
