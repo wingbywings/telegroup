@@ -29,6 +29,16 @@
    ```
 5) 如需定时，使用 cron/launchd/Task Scheduler 调用 `--pull --report` 即可。
 
+## 配置字段说明（参考 `config/config.example.json`）
+- `api_id` / `api_hash` / `phone`：Telegram API 凭证与手机号，手机号请包含国家码。
+- `session_path`：Telethon 会话文件路径，默认 `config/telethon.session`。
+- `db_path` / `last_id_path` / `report_dir`：SQLite 数据库、增量记录与日报目录，可按需调整路径（确保目录存在）。
+- `timezone`：日报按此时区切割日期；`pull_days` 控制向前回溯的天数。
+- `send_report_to_me`：是否将生成的日报发到 Saved Messages。
+- `download_media` / `media_dir` / `max_media_mb`：控制是否下载媒体、存储目录与大小上限（仅下载非视频/非语音）。
+- `enable_ai_summary` 与 `ai_*`：可选 AI 归类/摘要配置，关闭则不会请求外部 API。
+- `chats`：待拉取的群列表，提供 `chat_id` 或 `chat_link` 即可，`name` 用于标记；`chat_type`、`min_thread_messages`、`enable_thread_classification` 控制线程分类策略。
+
 ## 后续
 - 实现增量抓取、SQLite 写入、Markdown 报表、发送到 “Saved Messages”。
 - 媒体下载策略：仅下载小于 `max_media_mb`（默认 10MB）的非视频/非语音文件，路径在 `data/media/`。
