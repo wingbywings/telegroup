@@ -30,6 +30,21 @@ class ChatConfig:
             if self.chat_type not in ("crypto", "tech", "news"):
                 log.warning("Invalid chat_type '%s' for chat %s, will auto-detect", self.chat_type, self.chat_id)
                 self.chat_type = None
+        # 可选：该群组的最小线程消息数量限制，用于AI分析
+        # 如果不指定，使用全局默认值 MIN_THREAD_MESSAGES
+        if "min_thread_messages" in raw:
+            self.min_thread_messages: Optional[int] = int(raw["min_thread_messages"])
+            if self.min_thread_messages < 1:
+                log.warning("Invalid min_thread_messages %s for chat %s, must be >= 1, using default", 
+                           self.min_thread_messages, self.chat_id)
+                self.min_thread_messages = None
+        else:
+            self.min_thread_messages = None
+        # 可选：是否需要thread_id分类
+        # 如果设置为true，则根据reply_to进行thread_id分类（正常分类行为）
+        # 如果设置为false或不配置，则该群组下所有消息的thread_id都将被设置为-1（不进行分类）
+        # 默认为false，即不进行分类
+        self.enable_thread_classification: bool = bool(raw.get("enable_thread_classification", False))
 
 
 class Config:

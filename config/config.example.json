@@ -25,12 +25,16 @@
       "chat_id": -1001234567890,
       "chat_link": "https://t.me/your_group_username",
       "name": "群组1",
-      "chat_type": "crypto"
+      "chat_type": "crypto",
+      "min_thread_messages": 5,
+      "enable_thread_classification": true
     },
     {
       "chat_id": -1009876543210,
       "name": "群组2",
-      "chat_type": "tech"
+      "chat_type": "tech",
+      "min_thread_messages": 15,
+      "enable_thread_classification": false
     },
     {
       "chat_link": "https://t.me/another_group",
@@ -40,7 +44,9 @@
       "chat_id": -1001234567891,
       "chat_link": "https://t.me/news_group",
       "name": "新闻群组",
-      "chat_type": "news"
+      "chat_type": "news",
+      "min_thread_messages": 8,
+      "enable_thread_classification": false
     }
   ]
 }

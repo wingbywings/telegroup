@@ -113,6 +113,9 @@ async def fetch_incremental_for_chat(
                              cutoff.isoformat(), tz_name)
                 continue
             media_type, file_id = extract_media(msg.media)
+            # 忽略所有 media_type 不为空的消息
+            if media_type is not None:
+                continue
             file_path: Optional[Path] = None
             if cfg.download_media and media_type and not is_video_or_voice(msg):
                 size = getattr(msg.file, "size", None) if getattr(msg, "file", None) else None
@@ -139,7 +142,12 @@ async def fetch_incremental_for_chat(
             # 根据 reply_to 字段进行分类：
             # - 如果 reply_to 不为 NULL，则 thread_id = reply_to（属于回复该消息的线程）
             # - 如果 reply_to 为 NULL，则 thread_id = TOP_THREAD_ID（顶层消息，统一归类）
-            thread_id = reply_to if reply_to is not None else TOP_THREAD_ID
+            # 如果群组配置了enable_thread_classification为true，则进行正常分类
+            # 否则（false或不配置），所有消息的thread_id都设置为TOP_THREAD_ID（-1）
+            if chat_config.enable_thread_classification:
+                thread_id = reply_to if reply_to is not None else TOP_THREAD_ID
+            else:
+                thread_id = TOP_THREAD_ID
             text = msg.message or ""
             conn.execute(
                 """
@@ -265,6 +273,7 @@ def _generate_all_reports(client: TelegramClient, cfg: Config) -> None:
                 chat_config.name,
                 chat_config.chat_type,
                 chat_config.chat_link,
+                chat_config.min_thread_messages,
             )
             if report_text.strip():
                 all_reports.append(report_text)

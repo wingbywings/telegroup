@@ -160,6 +160,7 @@ def generate_report(
     chat_name: Optional[str] = None,
     chat_type: Optional[str] = None,
     chat_link: Optional[str] = None,
+    min_thread_messages: Optional[int] = None,
 ) -> str:
     """为指定群组生成日报"""
     day_end = day_start + timedelta(days=1)
@@ -204,7 +205,7 @@ def generate_report(
     lines = _build_report_header(day_start, day_end, chat_id, chat_name, total, len(user_stats))
     lines.extend(_build_report_content(user_stats, media_stats, thread_stats, conn, chat_id, chat_link))
 
-    lines.extend(build_ai_summary_section(rows, cfg, day_start, chat_id, chat_name, chat_type, chat_link, conn))
+    lines.extend(build_ai_summary_section(rows, cfg, day_start, chat_id, chat_name, chat_type, chat_link, conn, min_thread_messages))
 
     report = "\n".join(lines)
     # 报告文件名包含 chat_id，如果有名称则使用名称（清理特殊字符）
@@ -671,6 +672,7 @@ def build_ai_summary_section(
     chat_type: Optional[str] = None,
     chat_link: Optional[str] = None,
     conn: Optional[sqlite3.Connection] = None,
+    min_thread_messages: Optional[int] = None,
 ) -> List[str]:
     if not cfg.enable_ai_summary:
         return []
@@ -692,17 +694,20 @@ def build_ai_summary_section(
         log.warning("AI summary enabled but database connection not provided.")
         return lines
 
+    # 确定使用的最小消息数量阈值：优先使用群组特定配置，否则使用全局默认值
+    threshold = min_thread_messages if min_thread_messages is not None else MIN_THREAD_MESSAGES
+
     # 按 thread_id 分组消息
     threads = _group_messages_by_thread(rows)
 
     # 过滤掉消息数量小于阈值的线程
-    valid_threads = {tid: msgs for tid, msgs in threads.items() if len(msgs) >= MIN_THREAD_MESSAGES}
+    valid_threads = {tid: msgs for tid, msgs in threads.items() if len(msgs) >= threshold}
 
     if not valid_threads:
-        lines.append(f"- 没有符合条件的线程（消息数量 >= {MIN_THREAD_MESSAGES}）。")
+        lines.append(f"- 没有符合条件的线程（消息数量 >= {threshold}）。")
         return lines
 
-    lines.append(f"- 共 {len(valid_threads)} 个线程符合分析条件（消息数量 >= {MIN_THREAD_MESSAGES}）")
+    lines.append(f"- 共 {len(valid_threads)} 个线程符合分析条件（消息数量 >= {threshold}）")
     lines.append("")
 
     tz_name = getattr(cfg.timezone, "key", None) or str(cfg.timezone)
