@@ -1,5 +1,6 @@
 import logging
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -10,6 +11,134 @@ log = logging.getLogger(__name__)
 
 class AISummaryError(RuntimeError):
     pass
+
+
+def _extract_json_from_content(content: str) -> Dict[str, Any]:
+    """
+    从模型返回的内容中提取 JSON 对象。
+    
+    处理以下情况：
+    1. 纯 JSON 字符串
+    2. 包含 markdown 代码块的 JSON（```json ... ``` 或 ``` ... ```）
+    3. 包含前后空白字符或换行
+    4. 包含其他文本前缀/后缀（尝试提取第一个有效的 JSON 对象）
+    
+    Args:
+        content: 模型返回的原始内容
+        
+    Returns:
+        解析后的 JSON 字典
+        
+    Raises:
+        AISummaryError: 如果无法提取有效的 JSON
+    """
+    if not content:
+        raise AISummaryError("content is empty")
+    
+    # 去除前后空白字符
+    content = content.strip()
+    
+    # 情况1: 尝试直接解析（纯 JSON）
+    try:
+        return json.loads(content)
+    except json.JSONDecodeError:
+        pass
+    
+    # 情况2: 处理 markdown 代码块格式（```json ... ``` 或 ``` ... ```）
+    # 匹配 ```json ... ``` 或 ``` ... ```
+    code_block_pattern = r'```(?:json)?\s*\n?(.*?)\n?```'
+    match = re.search(code_block_pattern, content, re.DOTALL)
+    if match:
+        json_str = match.group(1).strip()
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+    
+    # 情况3: 尝试从文本中提取 JSON 对象（使用括号匹配）
+    # 从第一个 { 开始，尝试找到匹配的 }
+    start_idx = content.find('{')
+    if start_idx >= 0:
+        brace_count = 0
+        in_string = False
+        escape_next = False
+        
+        for i in range(start_idx, len(content)):
+            char = content[i]
+            
+            # 处理转义字符
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if char == '\\':
+                escape_next = True
+                continue
+            
+            # 处理字符串边界
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            
+            # 只在非字符串状态下计算括号
+            if not in_string:
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        json_str = content[start_idx:i+1]
+                        try:
+                            return json.loads(json_str)
+                        except json.JSONDecodeError:
+                            break
+    
+    # 情况4: 尝试查找 JSON 数组（如果返回的是数组格式）
+    # 从第一个 [ 开始，尝试找到匹配的 ]
+    start_idx = content.find('[')
+    if start_idx >= 0:
+        bracket_count = 0
+        in_string = False
+        escape_next = False
+        
+        for i in range(start_idx, len(content)):
+            char = content[i]
+            
+            # 处理转义字符
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if char == '\\':
+                escape_next = True
+                continue
+            
+            # 处理字符串边界
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            
+            # 只在非字符串状态下计算括号
+            if not in_string:
+                if char == '[':
+                    bracket_count += 1
+                elif char == ']':
+                    bracket_count -= 1
+                    if bracket_count == 0:
+                        json_str = content[start_idx:i+1]
+                        try:
+                            result = json.loads(json_str)
+                            # 如果解析成功但返回的是数组，包装成字典
+                            if isinstance(result, list):
+                                return {"categories": result}
+                            return result
+                        except json.JSONDecodeError:
+                            break
+    
+    # 如果所有方法都失败，抛出错误
+    raise AISummaryError(
+        f"无法从模型返回内容中提取有效的 JSON。内容预览: {content[:200]}..."
+    )
 
 
 def call_chat_analysis(
@@ -29,7 +158,7 @@ def call_chat_analysis(
     }
 
     # 从 payload 中提取群组类型和名称
-    chat_type = payload.get("chat_type")  # "crypto" 或 "tech" 或 None
+    chat_type = payload.get("chat_type")  # "crypto" 或 "tech" 或 "news" 或 None
     chat_name = payload.get("chat_name", "")
     
     # 构建系统提示词
@@ -69,11 +198,28 @@ def call_chat_analysis(
             "5. Bug 修复 & Patch 发布",
             "6. 路线图变化",
         ])
+    elif chat_type == "news":
+        sys_prompt_parts.extend([
+            "这是一个**新闻类群组**，重点关注以下重要新闻和信息：",
+            "1. 重大新闻事件（突发新闻、重要政策、社会事件等）",
+            "2. 新闻要点和关键信息（时间、地点、人物、事件核心）",
+            "3. 新闻来源和可信度（官方发布、权威媒体、社交媒体等）",
+            "4. 新闻背景和上下文（历史背景、相关事件、影响范围）",
+            "5. 后续发展和追踪（事件进展、官方回应、后续报道）",
+            "6. 重要观点和分析（专家解读、深度分析、不同观点）",
+            "",
+            "注意：",
+            "- 优先提取真实、可验证的新闻事件",
+            "- 区分新闻事实和观点评论",
+            "- 忽略重复转发、无来源消息、谣言和未经证实的信息",
+            "- 关注新闻的时间线和因果关系",
+        ])
     else:
         sys_prompt_parts.extend([
             "请根据消息内容自动判断群组类型：",
             "- 如果涉及加密货币、交易、DeFi、NFT等 → 按加密货币群标准筛选",
             "- 如果涉及代码、开发、技术讨论、项目开发 → 按技术项目群标准筛选",
+            "- 如果涉及新闻、时事、社会事件、媒体报道等 → 按新闻类群组标准筛选",
             "- 如果无法判断，优先提取事件类和重要观点类信息",
         ])
     
@@ -170,6 +316,9 @@ def call_chat_analysis(
         raise AISummaryError("no content returned from model")
 
     try:
-        return json.loads(content)
+        return _extract_json_from_content(content)
+    except AISummaryError:
+        # 重新抛出 AISummaryError，保持原始错误信息
+        raise
     except Exception as exc:
-        raise AISummaryError(f"model returned non-JSON content: {content}") from exc
+        raise AISummaryError(f"解析 JSON 时发生错误: {exc}，内容预览: {content[:200]}...") from exc

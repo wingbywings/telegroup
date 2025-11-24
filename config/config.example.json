@@ -35,6 +35,12 @@
     {
       "chat_link": "https://t.me/another_group",
       "name": "群组3"
+    },
+    {
+      "chat_id": -1001234567891,
+      "chat_link": "https://t.me/news_group",
+      "name": "新闻群组",
+      "chat_type": "news"
     }
   ]
 }

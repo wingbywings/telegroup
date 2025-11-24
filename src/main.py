@@ -7,214 +7,20 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from telethon import TelegramClient
-from telethon.tl.types import DocumentAttributeAudio, DocumentAttributeVideo
 
-from ai_client import AISummaryError, call_chat_analysis
+from config import ChatConfig, Config, load_config
+from constants import TOP_THREAD_ID
+from database import ensure_dirs, ensure_db, get_last_id, set_last_id
+from message_handler import (
+    build_media_path,
+    extract_media,
+    is_video_or_voice,
+    normalize_dt,
+)
+from report_generator import generate_report
 
 
 log = logging.getLogger(__name__)
-
-
-class ChatConfig:
-    """单个群组的配置"""
-    def __init__(self, raw: Dict[str, Any]) -> None:
-        self.chat_id: int = int(raw.get("chat_id", 0))
-        chat_link_raw = raw.get("chat_link")
-        if chat_link_raw:
-            self.chat_link: Optional[str] = str(chat_link_raw).strip()
-            if not self.chat_link:  # 空字符串转为 None
-                self.chat_link = None
-        else:
-            self.chat_link = None
-        # 可选：群组名称，用于报告标题
-        self.name: Optional[str] = raw.get("name")
-        # 可选：群组类型，用于AI分析策略（"crypto" 加密货币群 / "tech" 技术项目群）
-        # 如果不指定，AI会根据消息内容自动判断
-        self.chat_type: Optional[str] = raw.get("chat_type")
-        if self.chat_type:
-            self.chat_type = self.chat_type.strip().lower()
-            if self.chat_type not in ("crypto", "tech"):
-                log.warning("Invalid chat_type '%s' for chat %s, will auto-detect", self.chat_type, self.chat_id)
-                self.chat_type = None
-
-
-class Config:
-    def __init__(self, raw: Dict[str, Any]) -> None:
-        self.api_id: int = int(raw["api_id"])
-        self.api_hash: str = str(raw["api_hash"])
-        self.phone: str = str(raw["phone"])
-        self.session_path: Path = Path(raw.get("session_path", "config/telethon.session"))
-        
-        # 支持多个群组配置
-        # 优先使用新的 chats 数组格式，如果没有则向后兼容旧的 chat_id/chat_link
-        if "chats" in raw:
-            self.chats: List[ChatConfig] = [ChatConfig(chat_raw) for chat_raw in raw["chats"]]
-        else:
-            # 向后兼容：将旧的 chat_id/chat_link 转换为 chats 数组
-            chat_config = {}
-            if "chat_id" in raw:
-                chat_config["chat_id"] = raw["chat_id"]
-            if "chat_link" in raw:
-                chat_link_raw = raw["chat_link"]
-                if chat_link_raw:
-                    chat_config["chat_link"] = str(chat_link_raw).strip() or None
-            if chat_config:
-                self.chats = [ChatConfig(chat_config)]
-            else:
-                self.chats = []
-        
-        # 保持向后兼容的单个 chat_id 和 chat_link（用于旧代码）
-        if self.chats:
-            self.chat_id: int = self.chats[0].chat_id
-            self.chat_link: Optional[str] = self.chats[0].chat_link
-        else:
-            self.chat_id = 0
-            self.chat_link = None
-        
-        self.db_path: Path = Path(raw.get("db_path", "data/messages.db"))
-        self.report_dir: Path = Path(raw.get("report_dir", "reports"))
-        self.media_dir: Path = Path(raw.get("media_dir", "data/media"))
-        self.timezone: timezone = timezone.utc
-        tz_name = raw.get("timezone")
-        if tz_name:
-            try:
-                from zoneinfo import ZoneInfo
-
-                self.timezone = ZoneInfo(tz_name)
-            except Exception as exc:  # pragma: no cover - best effort fallback
-                log.warning("Failed to load timezone %s: %s, fallback to UTC", tz_name, exc)
-        self.last_id_path: Path = Path(raw.get("last_id_path", "data/last_id.json"))
-        self.pull_days: int = int(raw.get("pull_days", 2))
-        self.send_report_to_me: bool = bool(raw.get("send_report_to_me", True))
-        self.download_media: bool = bool(raw.get("download_media", True))
-        self.max_media_mb: int = int(raw.get("max_media_mb", 10))
-        self.enable_ai_summary: bool = bool(raw.get("enable_ai_summary", False))
-        self.ai_api_base: str = str(raw.get("ai_api_base", "")).strip()
-        self.ai_api_key: str = str(raw.get("ai_api_key", "")).strip()
-        self.ai_model: str = str(raw.get("ai_model", "grok-beta")).strip()
-        self.ai_max_categories: int = int(raw.get("ai_max_categories", 5))
-        self.ai_timeout: float = float(raw.get("ai_timeout", 120.0))
-        self.ai_style: Optional[str] = str(raw["ai_style"]).strip() if "ai_style" in raw else None
-        self.ai_max_messages_per_batch: int = int(raw.get("ai_max_messages_per_batch", 200))
-
-
-def load_config(path: Path) -> Config:
-    with path.open("r", encoding="utf-8") as f:
-        raw = json.load(f)
-    return Config(raw)
-
-
-def ensure_dirs(cfg: Config) -> None:
-    cfg.session_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg.report_dir.mkdir(parents=True, exist_ok=True)
-    cfg.last_id_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg.media_dir.mkdir(parents=True, exist_ok=True)
-
-
-def ensure_db(cfg: Config) -> None:
-    conn = sqlite3.connect(cfg.db_path)
-    try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS messages (
-                chat_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                user_id INTEGER,
-                username TEXT,
-                text TEXT,
-                media_type TEXT,
-                file_id TEXT,
-                reply_to INTEGER,
-                date TEXT NOT NULL,
-                file_path TEXT,
-                thread_id INTEGER,
-                PRIMARY KEY (chat_id, message_id)
-            );
-            """
-        )
-        # Migration: ensure file_path column exists
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()}
-        if "file_path" not in cols:
-            conn.execute("ALTER TABLE messages ADD COLUMN file_path TEXT;")
-        # Migration: ensure thread_id column exists and populate it
-        if "thread_id" not in cols:
-            conn.execute("ALTER TABLE messages ADD COLUMN thread_id INTEGER;")
-            # 根据 reply_to 字段进行分类：
-            # - 如果 reply_to 不为 NULL，则 thread_id = reply_to（属于回复该消息的线程）
-            # - 如果 reply_to 为 NULL，则 thread_id = -1（顶层消息，统一归类）
-            conn.execute(
-                """
-                UPDATE messages
-                SET thread_id = CASE
-                    WHEN reply_to IS NOT NULL THEN reply_to
-                    ELSE -1
-                END
-                """
-            )
-            conn.commit()
-            log.info("Added thread_id column and populated based on reply_to classification")
-        else:
-            # Migration: update existing records where reply_to is NULL to use thread_id = -1
-            conn.execute(
-                """
-                UPDATE messages
-                SET thread_id = -1
-                WHERE reply_to IS NULL AND thread_id != -1
-                """
-            )
-            conn.commit()
-            updated = conn.execute("SELECT changes()").fetchone()[0]
-            if updated > 0:
-                log.info("Updated %s messages without reply_to to thread_id=-1", updated)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def get_last_id(cfg: Config, chat_id: int) -> int:
-    """获取指定群组的 last_id"""
-    if not cfg.last_id_path.exists():
-        # 尝试迁移旧的 last_id.txt 文件
-        old_path = cfg.last_id_path.parent / "last_id.txt"
-        if old_path.exists():
-            try:
-                old_value = int(old_path.read_text().strip() or "0")
-                # 迁移到新格式
-                data = {str(cfg.chat_id): old_value}
-                cfg.last_id_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
-                log.info("Migrated last_id.txt to last_id.json for chat_id %s", cfg.chat_id)
-                return old_value
-            except (ValueError, KeyError):
-                pass
-        return 0
-    try:
-        data = json.loads(cfg.last_id_path.read_text(encoding="utf-8"))
-        # 支持旧格式（单个数字）和新格式（JSON 对象）
-        if isinstance(data, dict):
-            return int(data.get(str(chat_id), 0))
-        else:
-            # 旧格式：单个数字，只对第一个群组有效
-            return int(data) if chat_id == cfg.chat_id else 0
-    except (json.JSONDecodeError, ValueError, KeyError):
-        return 0
-
-
-def set_last_id(cfg: Config, chat_id: int, value: int) -> None:
-    """设置指定群组的 last_id"""
-    data: Dict[str, int] = {}
-    if cfg.last_id_path.exists():
-        try:
-            existing = json.loads(cfg.last_id_path.read_text(encoding="utf-8"))
-            if isinstance(existing, dict):
-                data = existing
-            else:
-                # 迁移旧格式
-                data = {str(cfg.chat_id): int(existing)}
-        except (json.JSONDecodeError, ValueError):
-            pass
-    data[str(chat_id)] = value
-    cfg.last_id_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
 def build_client(cfg: Config) -> TelegramClient:
@@ -247,51 +53,6 @@ async def get_chat_id_from_link(client: TelegramClient, chat_link: str) -> int:
     return chat_id
 
 
-def normalize_dt(dt: datetime, tz: timezone) -> datetime:
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(tz)
-
-
-def extract_media(meta) -> Tuple[Optional[str], Optional[str]]:
-    if not meta:
-        return None, None
-    media_type = meta.__class__.__name__
-    file_id = None
-    try:
-        file_id = meta.file.id  # type: ignore[attr-defined]
-    except Exception:
-        file_id = None
-    return media_type, file_id
-
-
-def is_video_or_voice(msg) -> bool:
-    if getattr(msg, "video", None) or getattr(msg, "video_note", None) or getattr(msg, "voice", None):
-        return True
-    doc = getattr(msg, "document", None)
-    if doc and getattr(doc, "attributes", None):
-        for attr in doc.attributes:
-            if isinstance(attr, DocumentAttributeVideo):
-                return True
-            if isinstance(attr, DocumentAttributeAudio) and getattr(attr, "voice", False):
-                return True
-    return False
-
-
-def build_media_path(msg, cfg: Config) -> Path:
-    name = None
-    if getattr(msg, "file", None):
-        name = getattr(msg.file, "name", None)
-        ext = getattr(msg.file, "ext", None)
-    else:
-        ext = None
-    if name:
-        return cfg.media_dir / f"{msg.id}_{name}"
-    if ext:
-        return cfg.media_dir / f"{msg.id}{ext}"
-    return cfg.media_dir / f"{msg.id}.bin"
-
-
 async def init_session(client: TelegramClient, cfg: Config) -> None:
     await client.connect()
     if await client.is_user_authorized():
@@ -314,11 +75,20 @@ async def fetch_incremental_for_chat(
     chat_id = chat_config.chat_id
     chat_name = chat_config.name or f"chat_{chat_id}"
     last_id = get_last_id(cfg, chat_id)
-    cutoff = datetime.now(tz=cfg.timezone) - timedelta(days=cfg.pull_days)
+    now_cfg = datetime.now(tz=cfg.timezone)
+    cutoff = now_cfg - timedelta(days=cfg.pull_days)
     inserted = 0
+    skipped_by_time = 0
     max_id = last_id
     
+    # 记录时间范围信息用于排查
+    cutoff_utc = cutoff.astimezone(timezone.utc)
+    now_utc = now_cfg.astimezone(timezone.utc)
+    tz_name = getattr(cfg.timezone, "key", None) or str(cfg.timezone)
     log.info("Fetching messages for %s (chat_id: %s, last_id: %s)", chat_name, chat_id, last_id)
+    log.info("Time range: now=%s (%s), cutoff=%s (%s), pull_days=%d", 
+             now_cfg.isoformat(), tz_name, cutoff.isoformat(), tz_name, cfg.pull_days)
+    log.info("Time range (UTC): now=%s, cutoff=%s", now_utc.isoformat(), cutoff_utc.isoformat())
     
     try:
         async for msg in client.iter_messages(
@@ -330,8 +100,17 @@ async def fetch_incremental_for_chat(
                 continue
             if msg.action:
                 continue
+            # 记录原始消息时间的时区信息
+            msg_date_original = msg.date
             msg_dt = normalize_dt(msg.date, cfg.timezone)
             if msg_dt < cutoff:
+                skipped_by_time += 1
+                # 只记录前几条被过滤的消息，避免日志过多
+                if skipped_by_time <= 3:
+                    msg_utc = msg_date_original.astimezone(timezone.utc) if msg_date_original.tzinfo else msg_date_original.replace(tzinfo=timezone.utc)
+                    log.debug("Skipped message %s: date=%s (UTC: %s, %s: %s) < cutoff=%s (%s)", 
+                             msg.id, msg_date_original, msg_utc.isoformat(), tz_name, msg_dt.isoformat(), 
+                             cutoff.isoformat(), tz_name)
                 continue
             media_type, file_id = extract_media(msg.media)
             file_path: Optional[Path] = None
@@ -346,11 +125,21 @@ async def fetch_incremental_for_chat(
                         log.warning("Download failed for msg %s: %s", msg.id, exc)
                 else:
                     log.debug("Skip media download for msg %s due to size or unknown", msg.id)
-            reply_to = msg.reply_to.reply_to_msg_id if msg.reply_to else None
+            # 提取 reply_to 字段：处理回复消息的情况
+            # Telethon 的 reply_to 可能是 MessageReplyHeader 对象
+            reply_to = None
+            if msg.reply_to:
+                # 优先使用 reply_to_msg_id（普通回复）
+                if hasattr(msg.reply_to, "reply_to_msg_id") and msg.reply_to.reply_to_msg_id:
+                    reply_to = msg.reply_to.reply_to_msg_id
+                # 如果是论坛主题回复，可能需要特殊处理（暂时忽略）
+                elif hasattr(msg.reply_to, "forum_topic") and msg.reply_to.forum_topic:
+                    log.debug("Message %s is a forum topic reply, skipping reply_to", msg.id)
+            
             # 根据 reply_to 字段进行分类：
             # - 如果 reply_to 不为 NULL，则 thread_id = reply_to（属于回复该消息的线程）
-            # - 如果 reply_to 为 NULL，则 thread_id = -1（顶层消息，统一归类）
-            thread_id = reply_to if reply_to is not None else -1
+            # - 如果 reply_to 为 NULL，则 thread_id = TOP_THREAD_ID（顶层消息，统一归类）
+            thread_id = reply_to if reply_to is not None else TOP_THREAD_ID
             text = msg.message or ""
             conn.execute(
                 """
@@ -381,8 +170,8 @@ async def fetch_incremental_for_chat(
 
     if max_id != last_id:
         set_last_id(cfg, chat_id, max_id)
-    log.info("Pulled %s new messages for %s (chat_id: %s, last_id %s -> %s)", 
-             inserted, chat_name, chat_id, last_id, max_id)
+    log.info("Pulled %s new messages for %s (chat_id: %s, last_id %s -> %s, skipped_by_time: %s)", 
+             inserted, chat_name, chat_id, last_id, max_id, skipped_by_time)
 
 
 async def fetch_incremental(client: TelegramClient, cfg: Config) -> None:
@@ -401,367 +190,6 @@ async def fetch_incremental(client: TelegramClient, cfg: Config) -> None:
         conn.close()
 
 
-def format_user(user_id: Optional[int], username: Optional[str]) -> str:
-    if username:
-        return f"@{username}"
-    if user_id:
-        return f"user_{user_id}"
-    return "unknown"
-
-
-def generate_report(conn: sqlite3.Connection, cfg: Config, day_start: datetime, chat_id: int, chat_name: Optional[str] = None, chat_type: Optional[str] = None) -> str:
-    """为指定群组生成日报"""
-    day_end = day_start + timedelta(days=1)
-    conn.row_factory = sqlite3.Row
-    cur = conn.execute(
-        """
-        SELECT message_id, user_id, username, text, media_type, reply_to, date, thread_id
-        FROM messages
-        WHERE chat_id = ? AND date >= ? AND date < ?
-        ORDER BY date ASC
-        """,
-        (chat_id, day_start.isoformat(), day_end.isoformat()),
-    )
-    rows = cur.fetchall()
-    total = len(rows)
-
-    user_stats: Dict[str, int] = {}
-    media_stats: Dict[str, int] = {}
-    thread_stats: Dict[int, int] = {}
-
-    for row in rows:
-        key = format_user(row["user_id"], row["username"])
-        user_stats[key] = user_stats.get(key, 0) + 1
-        if row["media_type"]:
-            media_stats[row["media_type"]] = media_stats.get(row["media_type"], 0) + 1
-        if row["reply_to"]:
-            thread_stats[row["reply_to"]] = thread_stats.get(row["reply_to"], 0) + 1
-
-    top_users = sorted(user_stats.items(), key=lambda x: x[1], reverse=True)[:5]
-    top_threads = sorted(thread_stats.items(), key=lambda x: x[1], reverse=True)[:5]
-
-    lines = []
-    date_str = day_start.date().isoformat()
-    chat_display_name = chat_name or f"群组 {chat_id}"
-    lines.append(f"# {date_str} {chat_display_name} 日报")
-    lines.append(f"- 群 ID: `{chat_id}`")
-    lines.append(f"- 时间范围: {day_start.isoformat()} ~ {day_end.isoformat()}")
-    lines.append(f"- 总消息数: {total}")
-    lines.append(f"- 发言人数: {len(user_stats)}")
-    lines.append("")
-
-    lines.append("## 活跃用户 Top 5")
-    if top_users:
-        for name, cnt in top_users:
-            lines.append(f"- {name}: {cnt}")
-    else:
-        lines.append("- 无")
-    lines.append("")
-
-    lines.append("## 媒体分布")
-    if media_stats:
-        for m, cnt in media_stats.items():
-            lines.append(f"- {m}: {cnt}")
-    else:
-        lines.append("- 无")
-    lines.append("")
-
-    lines.append("## 热门回复线程")
-    if top_threads:
-        for mid, cnt in top_threads:
-            lines.append(f"- 回复消息 {mid}: {cnt} 条回复")
-    else:
-        lines.append("- 无")
-
-    lines.extend(build_ai_summary_section(rows, cfg, day_start, chat_id, chat_name, chat_type))
-
-    report = "\n".join(lines)
-    # 报告文件名包含 chat_id，如果有名称则使用名称（清理特殊字符）
-    if chat_name:
-        safe_name = "".join(c if c.isalnum() or c in ('-', '_') else '_' for c in chat_name)
-        report_filename = f"{date_str}_{safe_name}_{chat_id}.md"
-    else:
-        report_filename = f"{date_str}_{chat_id}.md"
-    report_path = cfg.report_dir / report_filename
-    report_path.write_text(report, encoding="utf-8")
-    log.info("Report written to %s", report_path)
-    return report
-
-
-def build_ai_summary_section(rows: List[sqlite3.Row], cfg: Config, day_start: datetime, chat_id: int, chat_name: Optional[str] = None, chat_type: Optional[str] = None) -> List[str]:
-    if not cfg.enable_ai_summary:
-        return []
-
-    lines = ["", "## AI 线程摘要"]
-
-    if not cfg.ai_api_base:
-        lines.append("- AI 摘要未生成：缺少 ai_api_base 配置。")
-        log.warning("AI summary enabled but ai_api_base not set.")
-        return lines
-
-    if not cfg.ai_api_key:
-        lines.append("- AI 摘要未生成：缺少 ai_api_key 配置。")
-        log.warning("AI summary enabled but ai_api_key not set.")
-        return lines
-
-    # 按 thread_id 分组消息
-    threads: Dict[int, List[sqlite3.Row]] = {}
-    for row in rows:
-        thread_id = row["thread_id"]
-        if thread_id not in threads:
-            threads[thread_id] = []
-        threads[thread_id].append(row)
-
-    # 过滤掉消息数量小于 10 的线程
-    valid_threads = {tid: msgs for tid, msgs in threads.items() if len(msgs) >= 10}
-    
-    if not valid_threads:
-        lines.append("- 没有符合条件的线程（消息数量 >= 10）。")
-        return lines
-
-    lines.append(f"- 共 {len(valid_threads)} 个线程符合分析条件（消息数量 >= 10）")
-    lines.append("")
-
-    tz_name = getattr(cfg.timezone, "key", None) or str(cfg.timezone)
-
-    # 为每个符合条件的线程分别调用 AI 分析
-    for thread_id, thread_rows in sorted(valid_threads.items(), key=lambda x: len(x[1]), reverse=True):
-        thread_name = "顶层消息" if thread_id == -1 else f"线程 {thread_id}"
-        total_messages = len(thread_rows)
-        lines.append(f"### {thread_name}（{total_messages} 条消息）")
-
-        # 如果消息数量超过阈值，进行分段处理
-        if total_messages > cfg.ai_max_messages_per_batch:
-            num_batches = (total_messages + cfg.ai_max_messages_per_batch - 1) // cfg.ai_max_messages_per_batch
-            lines.append(f"  - 消息数量较多，将分成 {num_batches} 个批次处理（每批最多 {cfg.ai_max_messages_per_batch} 条）")
-            lines.append("")
-
-            all_overalls: List[str] = []
-            all_categories: List[Dict[str, Any]] = []
-            batch_failed = False
-
-            # 分段处理
-            for batch_idx in range(num_batches):
-                start_idx = batch_idx * cfg.ai_max_messages_per_batch
-                end_idx = min(start_idx + cfg.ai_max_messages_per_batch, total_messages)
-                batch_rows = thread_rows[start_idx:end_idx]
-                batch_num = batch_idx + 1
-
-                messages = []
-                for row in batch_rows:
-                    messages.append(
-                        {
-                            "id": row["message_id"],
-                            "user": format_user(row["user_id"], row["username"]),
-                            "ts": row["date"],
-                            "text": row["text"] or "",
-                            "media_type": row["media_type"],
-                            "reply_to": row["reply_to"],
-                        }
-                    )
-
-                payload: Dict[str, Any] = {
-                    "chat_id": chat_id,
-                    "chat_name": chat_name,
-                    "chat_type": chat_type,  # "crypto" 或 "tech"，如果为 None 则 AI 自动判断
-                    "date": day_start.date().isoformat(),
-                    "timezone": tz_name,
-                    "thread_id": thread_id,
-                    "messages": messages,
-                    "batch_info": f"批次 {batch_num}/{num_batches}，共 {total_messages} 条消息",
-                }
-                if cfg.ai_max_categories:
-                    payload["max_categories"] = cfg.ai_max_categories
-                if cfg.ai_style:
-                    payload["style"] = cfg.ai_style
-
-                log.info(
-                    "Calling AI summary for thread %s batch %s/%s: base=%s model=%s messages=%s",
-                    thread_id,
-                    batch_num,
-                    num_batches,
-                    cfg.ai_api_base,
-                    cfg.ai_model,
-                    len(messages),
-                )
-                try:
-                    data = call_chat_analysis(
-                        cfg.ai_api_base, cfg.ai_api_key, payload, model=cfg.ai_model, timeout=cfg.ai_timeout
-                    )
-                except AISummaryError as exc:
-                    lines.append(f"    - AI 摘要生成失败：{exc}")
-                    log.warning("AI summary failed for thread %s batch %s: %s", thread_id, batch_num, exc)
-                    batch_failed = True
-                    lines.append("")
-                    continue
-
-                batch_overall = data.get("overall")
-                if batch_overall:
-                    all_overalls.append(f"批次 {batch_num}: {batch_overall}")
-
-                batch_categories = data.get("categories") or []
-                if batch_categories:
-                    all_categories.extend(batch_categories)
-
-            # 合并所有批次的结果
-            if batch_failed and not all_overalls and not all_categories:
-                lines.append("  - 所有批次处理失败")
-            else:
-                if all_overalls:
-                    lines.append("  - 总览（各批次摘要）：")
-                    for overall in all_overalls:
-                        lines.append(f"    - {overall}")
-
-                if all_categories:
-                    lines.append("")
-                    lines.append("  - 分类详情（合并所有批次）：")
-                    # 合并相同名称的分类
-                    category_map: Dict[str, List[Dict[str, Any]]] = {}
-                    for cat in all_categories:
-                        name = cat.get("name") or "未命名分类"
-                        if name not in category_map:
-                            category_map[name] = []
-                        category_map[name].append(cat)
-                    
-                    # 定义标准分类的优先级顺序
-                    category_priority = {
-                        "关键事件": 1,
-                        "技术更新/开发者动态": 2,
-                        "技术更新": 2,
-                        "开发者动态": 2,
-                        "潜在风险&预警": 3,
-                        "潜在风险": 3,
-                        "预警": 3,
-                        "市场/社区情绪": 4,
-                        "市场情绪": 4,
-                        "社区情绪": 4,
-                        "需要关注的后续行动": 5,
-                        "后续行动": 5,
-                    }
-                    
-                    def get_priority(cat_name: str) -> int:
-                        return category_priority.get(cat_name, 99)
-                    
-                    sorted_names = sorted(category_map.keys(), key=get_priority)
-                    
-                    for name in sorted_names:
-                        cats = category_map[name]
-                        all_message_ids = []
-                        summaries = []
-                        for cat in cats:
-                            summary = cat.get("summary") or ""
-                            if summary:
-                                summaries.append(summary)
-                            msg_ids = cat.get("messages") or []
-                            all_message_ids.extend(msg_ids)
-                        
-                        # 去重消息ID
-                        unique_message_ids = list(dict.fromkeys(all_message_ids))
-                        message_refs = f"（消息ID: {', '.join(map(str, unique_message_ids[:5]))}" + ("..." if len(unique_message_ids) > 5 else "") + ")" if unique_message_ids else ""
-                        
-                        lines.append(f"    - **{name}**{message_refs}")
-                        if summaries:
-                            # 合并多个批次的摘要
-                            combined_summary = " | ".join(summaries) if len(summaries) > 1 else summaries[0]
-                            summary_lines = combined_summary.split("\n")
-                            for line in summary_lines:
-                                if line.strip():
-                                    lines.append(f"      {line}")
-
-        else:
-            # 消息数量不多，直接处理
-            messages = []
-            for row in thread_rows:
-                messages.append(
-                    {
-                        "id": row["message_id"],
-                        "user": format_user(row["user_id"], row["username"]),
-                        "ts": row["date"],
-                        "text": row["text"] or "",
-                        "media_type": row["media_type"],
-                        "reply_to": row["reply_to"],
-                    }
-                )
-
-            payload: Dict[str, Any] = {
-                "chat_id": chat_id,
-                "chat_name": chat_name,
-                "chat_type": chat_type,  # "crypto" 或 "tech"，如果为 None 则 AI 自动判断
-                "date": day_start.date().isoformat(),
-                "timezone": tz_name,
-                "thread_id": thread_id,
-                "messages": messages,
-            }
-            if cfg.ai_max_categories:
-                payload["max_categories"] = cfg.ai_max_categories
-            if cfg.ai_style:
-                payload["style"] = cfg.ai_style
-
-            log.info(
-                "Calling AI summary for thread %s: base=%s model=%s messages=%s",
-                thread_id,
-                cfg.ai_api_base,
-                cfg.ai_model,
-                len(messages),
-            )
-            try:
-                data = call_chat_analysis(
-                    cfg.ai_api_base, cfg.ai_api_key, payload, model=cfg.ai_model, timeout=cfg.ai_timeout
-                )
-            except AISummaryError as exc:
-                lines.append(f"  - AI 摘要生成失败：{exc}")
-                log.warning("AI summary failed for thread %s: %s", thread_id, exc)
-                lines.append("")
-                continue
-
-            overall = data.get("overall")
-            if overall:
-                lines.append(f"  - 总览：{overall}")
-
-            categories = data.get("categories") or []
-            if categories:
-                # 定义标准分类的优先级顺序（按重要性）
-                category_priority = {
-                    "关键事件": 1,
-                    "技术更新/开发者动态": 2,
-                    "技术更新": 2,  # 兼容变体
-                    "开发者动态": 2,
-                    "潜在风险&预警": 3,
-                    "潜在风险": 3,  # 兼容变体
-                    "预警": 3,
-                    "市场/社区情绪": 4,
-                    "市场情绪": 4,  # 兼容变体
-                    "社区情绪": 4,
-                    "需要关注的后续行动": 5,
-                    "后续行动": 5,  # 兼容变体
-                }
-                
-                # 按优先级排序
-                def get_priority(cat_name: str) -> int:
-                    return category_priority.get(cat_name, 99)  # 未定义的分类排在最后
-                
-                sorted_categories = sorted(categories, key=lambda c: get_priority(c.get("name", "")))
-                
-                lines.append("")
-                lines.append("  - 分类详情：")
-                for cat in sorted_categories:
-                    name = cat.get("name") or "未命名分类"
-                    summary = cat.get("summary") or ""
-                    message_ids = cat.get("messages") or []
-                    message_refs = f"（消息ID: {', '.join(map(str, message_ids[:5]))}" + ("..." if len(message_ids) > 5 else "") + ")" if message_ids else ""
-                    lines.append(f"    - **{name}**{message_refs}")
-                    if summary:
-                        # 如果摘要包含多行，适当缩进
-                        summary_lines = summary.split("\n")
-                        for line in summary_lines:
-                            if line.strip():
-                                lines.append(f"      {line}")
-            else:
-                lines.append("  - 未返回分类结果。")
-
-        lines.append("")
-
-    return lines
 
 
 def parse_args() -> argparse.Namespace:
@@ -771,6 +199,84 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pull", action="store_true", help="Pull incremental messages")
     parser.add_argument("--report", action="store_true", help="Generate daily report for today")
     return parser.parse_args()
+
+
+def _validate_and_resolve_chats(client: TelegramClient, cfg: Config) -> None:
+    """
+    验证并解析所有群组的 chat_id
+    
+    Args:
+        client: TelegramClient 实例
+        cfg: 配置对象
+    
+    Raises:
+        ValueError: 如果没有配置群组或配置无效
+    """
+    if not cfg.chats:
+        raise ValueError("No chats configured. Please configure at least one chat in config.json")
+    
+    for chat_config in cfg.chats:
+        # 如果配置了 chat_link，从链接获取 chat_id
+        if chat_config.chat_link:
+            if not chat_config.chat_id or chat_config.chat_id == 0:
+                log.info("Resolving chat_id from chat_link: %s", chat_config.chat_link)
+                chat_config.chat_id = client.loop.run_until_complete(
+                    get_chat_id_from_link(client, chat_config.chat_link)
+                )
+            else:
+                log.info("Both chat_link and chat_id are configured for %s. Using chat_id: %s", 
+                         chat_config.name or "chat", chat_config.chat_id)
+        elif not chat_config.chat_id or chat_config.chat_id == 0:
+            raise ValueError(
+                f"Either chat_id or chat_link must be configured for chat: {chat_config.name or 'unnamed'}"
+            )
+    
+    # 更新向后兼容的单个 chat_id（用于旧代码）
+    if cfg.chats:
+        cfg.chat_id = cfg.chats[0].chat_id
+        cfg.chat_link = cfg.chats[0].chat_link
+
+
+def _generate_all_reports(client: TelegramClient, cfg: Config) -> None:
+    """
+    为所有配置的群组生成报告
+    
+    Args:
+        client: TelegramClient 实例
+        cfg: 配置对象
+    """
+    conn = sqlite3.connect(cfg.db_path)
+    try:
+        now_cfg = datetime.now(tz=cfg.timezone)
+        today = now_cfg.date()
+        day_start = datetime.combine(today, datetime.min.time(), tzinfo=cfg.timezone)
+        tz_name = getattr(cfg.timezone, "key", None) or str(cfg.timezone)
+        log.info("Generating reports for date: %s (%s), day_start: %s", 
+                 today.isoformat(), tz_name, day_start.isoformat())
+        all_reports: List[str] = []
+        
+        # 为每个群组生成报告
+        for chat_config in cfg.chats:
+            report_text = generate_report(
+                conn,
+                cfg,
+                day_start,
+                chat_config.chat_id,
+                chat_config.name,
+                chat_config.chat_type,
+                chat_config.chat_link,
+            )
+            if report_text.strip():
+                all_reports.append(report_text)
+    finally:
+        conn.close()
+    
+    # 如果配置了发送报告，将所有报告合并发送
+    if cfg.send_report_to_me and all_reports:
+        combined_report = "\n\n---\n\n".join(all_reports)
+        client.loop.run_until_complete(
+            client.send_message("me", combined_report, parse_mode="md")
+        )
 
 
 def main() -> None:
@@ -797,62 +303,14 @@ def main() -> None:
         if not client.loop.run_until_complete(client.is_user_authorized()):
             raise RuntimeError("Session not authorized. Run with --init-session first.")
 
-        # 解析所有群组的 chat_id
-        if not cfg.chats:
-            raise ValueError("No chats configured. Please configure at least one chat in config.json")
-        
-        for chat_config in cfg.chats:
-            # 如果配置了 chat_link，从链接获取 chat_id
-            if chat_config.chat_link:
-                if not chat_config.chat_id or chat_config.chat_id == 0:
-                    log.info("Resolving chat_id from chat_link: %s", chat_config.chat_link)
-                    chat_config.chat_id = client.loop.run_until_complete(
-                        get_chat_id_from_link(client, chat_config.chat_link)
-                    )
-                else:
-                    log.info("Both chat_link and chat_id are configured for %s. Using chat_id: %s", 
-                             chat_config.name or "chat", chat_config.chat_id)
-            elif not chat_config.chat_id or chat_config.chat_id == 0:
-                raise ValueError(
-                    f"Either chat_id or chat_link must be configured for chat: {chat_config.name or 'unnamed'}"
-                )
-        
-        # 更新向后兼容的单个 chat_id（用于旧代码）
-        if cfg.chats:
-            cfg.chat_id = cfg.chats[0].chat_id
-            cfg.chat_link = cfg.chats[0].chat_link
+        # 验证并解析所有群组的 chat_id
+        _validate_and_resolve_chats(client, cfg)
 
         if args.pull:
             client.loop.run_until_complete(fetch_incremental(client, cfg))
 
         if args.report:
-            conn = sqlite3.connect(cfg.db_path)
-            try:
-                today = datetime.now(tz=cfg.timezone).date()
-                day_start = datetime.combine(today, datetime.min.time(), tzinfo=cfg.timezone)
-                all_reports: List[str] = []
-                
-                # 为每个群组生成报告
-                for chat_config in cfg.chats:
-                    report_text = generate_report(
-                        conn,
-                        cfg,
-                        day_start,
-                        chat_config.chat_id,
-                        chat_config.name,
-                        chat_config.chat_type,
-                    )
-                    if report_text.strip():
-                        all_reports.append(report_text)
-            finally:
-                conn.close()
-            
-            # 如果配置了发送报告，将所有报告合并发送
-            if cfg.send_report_to_me and all_reports:
-                combined_report = "\n\n---\n\n".join(all_reports)
-                client.loop.run_until_complete(
-                    client.send_message("me", combined_report, parse_mode="md")
-                )
+            _generate_all_reports(client, cfg)
 
 
 if __name__ == "__main__":
