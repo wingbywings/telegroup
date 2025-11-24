@@ -1,6 +1,6 @@
-# Telethon 群消息日汇总（增量拉取方案）
+# Telegram 群消息智能分析系统
 
-基于 Telethon 的轻量脚本：按天增量拉取指定群消息，存入 SQLite，再生成 Markdown 日报（可发给自己或存本地）。
+该系统基于 Telethon 库，实现Telegram指定群组聊天消息的统计分析。可以按天增量拉取指定群消息，接入AI智能分析，最终生成 Markdown 日报。
 
 ## 目录结构
 - `src/`：主脚本与工具
@@ -27,7 +27,7 @@
    ```bash
    python src/main.py --pull --report
    ```
-5) 如需定时，使用 cron/launchd/Task Scheduler 调用 `--pull --report` 即可。
+5) 如需定时调用，可使用 cron/launchd/Task Scheduler 调用 `--pull --report` 即可。
 
 ## 配置字段说明（参考 `config/config.example.json`）
 - `api_id` / `api_hash` / `phone`：Telegram API 凭证与手机号，手机号请包含国家码。
